@@ -19,7 +19,7 @@ pipeline {
                     env.HOPS_NATIVE_BRANCH = branch
 
                     def DLVersion = sh (
-                        script: '''cargo metadata --format-version 1 --no-deps 2>/dev/null | jq -r '.packages[] | select(.manifest_path | test("python/Cargo.toml$")) | .version' ''',
+                        script: '''awk -F'"' '/^version/ {print $2; exit}' python/Cargo.toml''',
                         returnStdout: true
                     ).trim()
                     echo "Extracted delta-rs version: ${DLVersion}"
@@ -41,9 +41,9 @@ pipeline {
         stage('Upload Delta Lake Wheel') {
             steps {
                 script {
-                    sh 'tar -czvf deltalake-${DELTA_RS_VERSION}-${HOPS_NATIVE_BRANCH}.tar.gz -C target/wheels .'
+                    sh "tar -czvf deltalake-${DELTA_RS_VERSION}-${HOPS_NATIVE_BRANCH}.tar.gz -C target/wheels ."
                     sh 'echo "uploading on nexus..."'
-                    sh 'curl -u $NEXUS_CREDS_USR:$NEXUS_CREDS_PSW --upload-file deltalake-${DELTA_RS_VERSION}-${HOPS_NATIVE_BRANCH}.tar.gz https://nexus.hops.works/repository/dev/hamid/deltalake-${DELTA_RS_VERSION}-${HOPS_NATIVE_BRANCH}.tar.gz'
+                    sh "curl -u $NEXUS_CREDS_USR:$NEXUS_CREDS_PSW --upload-file deltalake-${DELTA_RS_VERSION}-${HOPS_NATIVE_BRANCH}.tar.gz https://nexus.hops.works/repository/dev/hamid/deltalake-${DELTA_RS_VERSION}-${HOPS_NATIVE_BRANCH}.tar.gz"
                 }
             }
         }
