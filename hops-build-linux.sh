@@ -61,6 +61,9 @@ ENV PATH=${HOME}/.cargo/bin:$PATH
 EOF
 
 echo "Dockerfile created."
+
+DOCKER_INTERACTIVE_RUN=${DOCKER_INTERACTIVE_RUN-"-i -t"}
+
 # Build the Docker image with host user/group info.
 docker build \
   --build-arg USER_ID="$(id -u)" \
@@ -72,7 +75,7 @@ docker build \
 echo "Docker image built successfully."
 
 # Run the container, mounting the current directory and executing build.sh.
-docker run --rm -it \
+docker run --rm=true $DOCKER_INTERACTIVE_RUN \
    -v "$(pwd):/home/$(id -un)"/delta-rs \
    delta-rs-build \
    /bin/bash -c "cd /home/$(id -un)/delta-rs/python && make clean && make build"
