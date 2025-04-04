@@ -5,6 +5,7 @@ pipeline {
         NEXUS_CREDS=credentials("HopsEE")
         HOPS_NATIVE_BRANCH = ''
         DELTA_RS_VERSION = ''
+
     }
     stages {
         stage('Extract Version Numbers') {
@@ -29,6 +30,7 @@ pipeline {
         stage('Build Wheel Files') {
             steps {
                 script {
+                    sh 'export DOCKER_INTERACTIVE_RUN='
                     sh 'pwd'
                     sh 'echo building wheel file'
                     sh 'chmod +x hops-build-linux.sh'
