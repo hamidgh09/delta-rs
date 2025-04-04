@@ -32,7 +32,7 @@ pipeline {
                 script {
                     sh 'export DOCKER_INTERACTIVE_RUN='
                     sh 'pwd'
-                    sh 'echo building wheel file'
+                    sh 'echo "building wheel file"'
                     sh 'chmod +x hops-build-linux.sh'
                     sh './hops-build-linux.sh'
                 }
@@ -42,7 +42,7 @@ pipeline {
             steps {
                 script {
                     sh 'tar -czvf deltalake-${DELTA_RS_VERSION}-${HOPS_NATIVE_BRANCH}.tar.gz -C target/wheels .'
-                    sh 'uploading on nexus...'
+                    sh 'echo "uploading on nexus..."'
                     sh 'curl -u $NEXUS_CREDS_USR:$NEXUS_CREDS_PSW --upload-file deltalake-${DELTA_RS_VERSION}-${HOPS_NATIVE_BRANCH}.tar.gz https://nexus.hops.works/repository/dev/hamid/deltalake-${DELTA_RS_VERSION}-${HOPS_NATIVE_BRANCH}.tar.gz'
                 }
             }
