@@ -37,6 +37,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     python3-pip \
     git \
     patchelf \
+    curl \
  && rm -rf /var/lib/apt/lists/*
 
 
