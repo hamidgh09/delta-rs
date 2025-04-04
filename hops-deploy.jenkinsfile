@@ -1,0 +1,42 @@
+pipeline {
+    agent any
+
+    environment {
+        NEXUS_CREDS=credentials("HopsEE")
+    }
+    stages {
+        stage('Build Wheel Files') {
+            steps {
+                script {
+                    sh 'export DOCKER_INTERACTIVE_RUN='
+                    sh 'pwd'
+                    sh 'echo "building wheel file"'
+                    sh 'chmod +x hops-build-linux.sh'
+                    sh './hops-build-linux.sh'
+                }
+            }
+        }
+        stage('Upload Delta Lake Wheel') {
+            steps {
+                script {
+                    DELTA_RS_VERSION = sh (
+                        script: '''awk -F'"' '/^version/ {print $2; exit}' python/Cargo.toml''',
+                        returnStdout: true
+                    ).trim()
+                    echo "Extracted delta-rs version: ${DELTA_RS_VERSION}"
+                    HOPS_NATIVE_BRANCH = sh(
+                        script: "grep 'hdfs-native-object-store' crates/hdfs/Cargo.toml | grep 'branch' | sed -n 's/.*branch *= *\"\\([^\"]*\\)\".*/\\1/p'",
+                        returnStdout: true
+                    ).trim()
+                    echo "Extracted hops native object store version: ${HOPS_NATIVE_BRANCH}"
+
+                    sh """
+                        tar -czvf deltalake-${DELTA_RS_VERSION}-${HOPS_NATIVE_BRANCH}.tar.gz -C target/wheels .
+                        echo "uploading on nexus..."
+                        curl -u $NEXUS_CREDS_USR:$NEXUS_CREDS_PSW --upload-file deltalake-${DELTA_RS_VERSION}-${HOPS_NATIVE_BRANCH}.tar.gz https://nexus.hops.works/repository/dev/hamid/deltalake-${DELTA_RS_VERSION}-${HOPS_NATIVE_BRANCH}.tar.gz
+                    """
+                }
+            }
+        }
+    }
+}
