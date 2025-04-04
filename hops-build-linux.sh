@@ -75,7 +75,7 @@ docker build \
 echo "Docker image built successfully."
 
 # Run the container, mounting the current directory and executing build.sh.
-docker run --rm=true $DOCKER_INTERACTIVE_RUN \
+docker run --rm=true \
    -v "$(pwd):/home/$(id -un)"/delta-rs \
    delta-rs-build \
    /bin/bash -c "cd /home/$(id -un)/delta-rs/python && make clean && make build"
