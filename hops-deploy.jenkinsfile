@@ -1,21 +1,27 @@
 pipeline {
     agent any
 
+    parameters {
+        booleanParam(name: 'EXPORT_NEXUS_CREDS', defaultValue: false, description: 'use nexus credentials if true')
+    }
+
     environment {
         REPO_CREDS = credentials('RepoHW')
         NEXUS_CREDS=credentials("HopsEE")
+
+        EXPORT_NEXUS_CREDS = "${params.EXPORT_NEXUS_CREDS}"
     }
     stages {
         stage('Build Wheel Files') {
             steps {
-                sh """
+                sh '''
                     pwd
-                    export HOPS_LIB_USERNAME=$NEXUS_CREDS_USR
-                    export HOPS_LIB_PASSWORD=$NEXUS_CREDS_PSW
+                    export HOPS_LIB_USERNAME=$( [ "$EXPORT_CREDS" = "true" ] && echo "$NEXUS_CREDS_USR" || echo "" )
+                    export HOPS_LIB_PASSWORD=$( [ "$EXPORT_CREDS" = "true" ] && echo "$NEXUS_CREDS_PSW" || echo "" )
                     echo "building wheel file"
                     chmod +x hops-build-linux.sh
                     ./hops-build-linux.sh
-                """
+                '''
             }
         }
         stage('Upload Delta Lake Wheel') {
