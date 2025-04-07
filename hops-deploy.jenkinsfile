@@ -1,0 +1,55 @@
+pipeline {
+    agent any
+
+    parameters {
+        booleanParam(name: 'EXPORT_NEXUS_CREDS', defaultValue: false, description: 'use nexus credentials if true')
+    }
+
+    environment {
+        REPO_CREDS = credentials('RepoHW')
+        NEXUS_CREDS=credentials("HopsEE")
+
+        EXPORT_NEXUS_CREDS = "${params.EXPORT_NEXUS_CREDS}"
+    }
+    stages {
+        stage('Build Wheel Files') {
+            steps {
+                sh '''
+                    pwd
+                    export HOPS_LIB_USERNAME=$( [ "$EXPORT_CREDS" = "true" ] && echo "$NEXUS_CREDS_USR" || echo "" )
+                    export HOPS_LIB_PASSWORD=$( [ "$EXPORT_CREDS" = "true" ] && echo "$NEXUS_CREDS_PSW" || echo "" )
+                    echo "building wheel file"
+                    chmod +x hops-build-linux.sh
+                    ./hops-build-linux.sh
+                '''
+            }
+        }
+        stage('Upload Delta Lake Wheel') {
+            steps {
+                script {
+                    DELTA_RS_VERSION = sh (
+                        script: '''awk -F'"' '/^version/ {print $2; exit}' python/Cargo.toml''',
+                        returnStdout: true
+                    ).trim()
+                    echo "Extracted delta-rs version: ${DELTA_RS_VERSION}"
+                    HOPS_NATIVE_BRANCH = sh(
+                        script: "grep 'hdfs-native-object-store' crates/hdfs/Cargo.toml | grep 'branch' | sed -n 's/.*branch *= *\"\\([^\"]*\\)\".*/\\1/p'",
+                        returnStdout: true
+                    ).trim()
+                    echo "Extracted hops native object store version: ${HOPS_NATIVE_BRANCH}"
+
+                    DST_WHL_FILE_NAME = "deltalake-${DELTA_RS_VERSION}-${HOPS_NATIVE_BRANCH}-linux-amd64.whl"
+                    FILE_DST = "repo@repo.hops.works:/opt/repository/master/delta-rs/${DST_WHL_FILE_NAME}"
+
+                    sh """
+                        cat $REPO_CREDS > id_rsa
+                        chmod 600 id_rsa
+                        echo "uploading on repo.hops.works ..."
+                        scp -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -i ./id_rsa target/wheels/deltalake*.whl ${FILE_DST}
+                        rm -f id_rsa
+                    """
+                }
+            }
+        }
+    }
+}

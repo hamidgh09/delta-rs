@@ -37,6 +37,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     python3-pip \
     git \
     patchelf \
+    curl \
  && rm -rf /var/lib/apt/lists/*
 
 
@@ -72,7 +73,7 @@ docker build \
 echo "Docker image built successfully."
 
 # Run the container, mounting the current directory and executing build.sh.
-docker run --rm -it \
+docker run --rm=true \
    -v "$(pwd):/home/$(id -un)"/delta-rs \
    delta-rs-build \
    /bin/bash -c "cd /home/$(id -un)/delta-rs/python && make clean && make build"
