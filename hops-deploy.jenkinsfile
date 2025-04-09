@@ -2,7 +2,7 @@ pipeline {
     agent any
 
     parameters {
-        booleanParam(name: 'EXPORT_NEXUS_CREDS', defaultValue: false, description: 'use nexus credentials if true')
+        booleanParam(name: 'EXPORT_NEXUS_CREDS', defaultValue: true, description: 'use nexus credentials if true')
     }
 
     environment {
