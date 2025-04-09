@@ -17,12 +17,17 @@ impl ObjectStoreFactory for HdfsFactory {
         url: &Url,
         options: &StorageOptions,
     ) -> DeltaResult<(ObjectStoreRef, Path)> {
-        let store: ObjectStoreRef = Arc::new(HdfsObjectStore::with_config(
+        let prefix = Path::parse(url.path())?;
+        let inner = HdfsObjectStore::with_config(
             url.as_str(),
             options.0.clone(),
-        )?);
-        let prefix = Path::parse(url.path())?;
-        Ok((url_prefix_handler(store, prefix.clone()), prefix))
+        )?;
+
+        let store = limit_store_handler(
+            url_prefix_handler(inner, prefix.clone()),
+            options
+        );
+        Ok((store, prefix))
     }
 }
 
