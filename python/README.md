@@ -1,10 +1,10 @@
-# Deltalake-python
+# Hops-deltalake-python
 
 [![PyPI](https://img.shields.io/pypi/v/deltalake.svg?style=flat-square)](https://pypi.org/project/deltalake/)
 [![userdoc](https://img.shields.io/badge/docs-user-blue)](https://delta-io.github.io/delta-rs/)
 [![apidoc](https://img.shields.io/badge/docs-api-blue)](https://delta-io.github.io/delta-rs/api/delta_table/)
 
-Native [Delta Lake](https://delta.io/) Python binding based on
+A HopsFS supported version of native [Delta Lake](https://delta.io/) Python binding based on
 [delta-rs](https://github.com/delta-io/delta-rs) with
 [Pandas](https://pandas.pydata.org/) integration.
 
@@ -27,11 +27,7 @@ See the [user guide](https://delta-io.github.io/delta-rs/usage/installation/) fo
 
 ```bash
 # with pip
-pip install deltalake
-# with uv
-uv add deltalake
-# with poetry
-poetry add deltalake
+pip install hops-deltalake
 ```
 
 NOTE: official binary wheels are linked against openssl statically for remote
