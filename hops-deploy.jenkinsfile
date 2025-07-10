@@ -18,6 +18,7 @@ pipeline {
                     pwd
                     export HOPS_LIB_USERNAME=$( [ "$EXPORT_CREDS" = "true" ] && echo "$NEXUS_CREDS_USR" || echo "" )
                     export HOPS_LIB_PASSWORD=$( [ "$EXPORT_CREDS" = "true" ] && echo "$NEXUS_CREDS_PSW" || echo "" )
+                    export MATURIN_EXTRA_ARGS=--release
                     echo "building wheel file"
                     chmod +x hops-build-linux.sh
                     ./hops-build-linux.sh
