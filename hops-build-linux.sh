@@ -76,4 +76,4 @@ echo "Docker image built successfully."
 docker run --rm=true \
    -v "$(pwd):/home/$(id -un)"/delta-rs \
    delta-rs-build \
-   /bin/bash -c "cd /home/$(id -un)/delta-rs/python && make clean && make build"
+   /bin/bash -c "cd /home/$(id -un)/delta-rs/python && make clean && export MATURIN_EXTRA_ARGS=--release && make build"
