@@ -7,14 +7,17 @@ compile_error!(
     for this crate to function properly."
 );
 
-use datafusion_common::DataFusionError;
-use deltalake_core::logstore::{default_logstore, logstores, LogStore, LogStoreFactory};
+use deltalake_core::logstore::{
+    default_logstore, logstore_factories, object_store::RetryConfig, LogStore, LogStoreFactory,
+    StorageConfig,
+};
 use reqwest::header::{HeaderValue, InvalidHeaderValue, AUTHORIZATION};
 use reqwest::Url;
 use std::collections::HashMap;
 use std::future::Future;
 use std::str::FromStr;
 use std::sync::Arc;
+use tokio::runtime::Handle;
 
 use crate::credential::{
     AzureCliCredential, ClientSecretOAuthProvider, CredentialProvider, WorkspaceOAuthProvider,
@@ -31,9 +34,8 @@ use deltalake_core::{
 };
 
 use crate::client::retry::*;
-use deltalake_core::storage::{
-    factories, str_is_truthy, IORuntime, ObjectStoreFactory, ObjectStoreRef, RetryConfigParse,
-    StorageOptions,
+use deltalake_core::logstore::{
+    config::str_is_truthy, object_store_factories, IORuntime, ObjectStoreFactory, ObjectStoreRef,
 };
 pub mod client;
 pub mod credential;
@@ -554,11 +556,9 @@ impl UnityCatalogBuilder {
             .get_temp_table_credentials(catalog_id, database_name, table_name)
             .await?;
         let credentials = match temp_creds_res {
-            TableTempCredentialsResponse::Success(temp_creds) => {
-                temp_creds.get_credentials().ok_or_else(|| {
-                    DataFusionError::External(UnityCatalogError::MissingCredential.into())
-                })?
-            }
+            TableTempCredentialsResponse::Success(temp_creds) => temp_creds
+                .get_credentials()
+                .ok_or_else(|| UnityCatalogError::MissingCredential)?,
             TableTempCredentialsResponse::Error(_error) => {
                 return Err(UnityCatalogError::TemporaryCredentialsFetchFailure)
             }
@@ -835,30 +835,33 @@ impl UnityCatalog {
 #[derive(Clone, Default, Debug)]
 pub struct UnityCatalogFactory {}
 
-impl RetryConfigParse for UnityCatalogFactory {}
-
 impl ObjectStoreFactory for UnityCatalogFactory {
     fn parse_url_opts(
         &self,
         table_uri: &Url,
-        options: &StorageOptions,
+        options: &HashMap<String, String>,
+        _retry: &RetryConfig,
+        handle: Option<Handle>,
     ) -> DeltaResult<(ObjectStoreRef, Path)> {
         let (table_path, temp_creds) = UnityCatalogBuilder::execute_uc_future(
             UnityCatalogBuilder::get_uc_location_and_token(table_uri.as_str()),
-        )?
-        .map_err(UnityCatalogError::from)?;
+        )??;
 
-        let mut storage_options = options.0.clone();
+        let mut storage_options = options.clone();
         storage_options.extend(temp_creds);
 
-        let mut builder =
-            DeltaTableBuilder::from_uri(&table_path).with_io_runtime(IORuntime::default());
+        // TODO(roeap): we should not have to go through the table here.
+        // ideally we just create the right storage ...
+        let mut builder = DeltaTableBuilder::from_uri(&table_path);
+
+        if let Some(handle) = handle {
+            builder = builder.with_io_runtime(IORuntime::RT(handle));
+        }
         if !storage_options.is_empty() {
             builder = builder.with_storage_options(storage_options.clone());
         }
-
         let prefix = Path::parse(table_uri.path())?;
-        let store = builder.build()?.object_store();
+        let store = builder.build_storage()?.object_store(None);
 
         Ok((store, prefix))
     }
@@ -867,21 +870,26 @@ impl ObjectStoreFactory for UnityCatalogFactory {
 impl LogStoreFactory for UnityCatalogFactory {
     fn with_options(
         &self,
-        store: ObjectStoreRef,
+        prefixed_store: ObjectStoreRef,
+        root_store: ObjectStoreRef,
         location: &Url,
-        options: &StorageOptions,
+        options: &StorageConfig,
     ) -> DeltaResult<Arc<dyn LogStore>> {
-        Ok(default_logstore(store, location, options))
+        Ok(default_logstore(
+            prefixed_store,
+            root_store,
+            location,
+            options,
+        ))
     }
 }
 
 /// Register an [ObjectStoreFactory] for common UnityCatalogFactory [Url] schemes
 pub fn register_handlers(_additional_prefixes: Option<Url>) {
     let factory = Arc::new(UnityCatalogFactory::default());
-    let scheme = "uc";
-    let url = Url::parse(&format!("{scheme}://")).unwrap();
-    factories().insert(url.clone(), factory.clone());
-    logstores().insert(url.clone(), factory.clone());
+    let url = Url::parse("uc://").unwrap();
+    object_store_factories().insert(url.clone(), factory.clone());
+    logstore_factories().insert(url.clone(), factory.clone());
 }
 
 #[async_trait::async_trait]

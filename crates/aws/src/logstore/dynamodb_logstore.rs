@@ -14,9 +14,7 @@ use url::Url;
 
 use deltalake_core::logstore::*;
 use deltalake_core::{
-    operations::transaction::TransactionError,
-    storage::{ObjectStoreRef, StorageOptions},
-    DeltaResult, DeltaTableError,
+    kernel::transaction::TransactionError, logstore::ObjectStoreRef, DeltaResult, DeltaTableError,
 };
 use uuid::Uuid;
 
@@ -25,7 +23,8 @@ const MAX_REPAIR_RETRIES: i64 = 3;
 
 /// [`LogStore`] implementation backed by DynamoDb
 pub struct S3DynamoDbLogStore {
-    pub(crate) storage: ObjectStoreRef,
+    prefixed_store: ObjectStoreRef,
+    root_store: ObjectStoreRef,
     lock_client: DynamoDbLockClient,
     config: LogStoreConfig,
     table_path: String,
@@ -41,9 +40,10 @@ impl S3DynamoDbLogStore {
     /// Create log store
     pub fn try_new(
         location: Url,
-        options: impl Into<StorageOptions> + Clone,
+        options: &StorageConfig,
         s3_options: &S3StorageOptions,
-        object_store: ObjectStoreRef,
+        prefixed_store: ObjectStoreRef,
+        root_store: ObjectStoreRef,
     ) -> DeltaResult<Self> {
         let lock_client = DynamoDbLockClient::try_new(
             &s3_options.sdk_config.clone().unwrap(),
@@ -73,11 +73,12 @@ impl S3DynamoDbLogStore {
         })?;
         let table_path = to_uri(&location, &Path::from(""));
         Ok(Self {
-            storage: object_store,
+            prefixed_store,
+            root_store,
             lock_client,
             config: LogStoreConfig {
                 location,
-                options: options.into(),
+                options: options.clone(),
             },
             table_path,
         })
@@ -309,12 +310,12 @@ impl LogStore for S3DynamoDbLogStore {
         }
     }
 
-    async fn get_earliest_version(&self, current_version: i64) -> DeltaResult<i64> {
-        get_earliest_version(self, current_version).await
+    fn object_store(&self, _operation_id: Option<Uuid>) -> ObjectStoreRef {
+        self.prefixed_store.clone()
     }
 
-    fn object_store(&self, _operation_id: Option<Uuid>) -> ObjectStoreRef {
-        self.storage.clone()
+    fn root_object_store(&self, _operation_id: Option<Uuid>) -> ObjectStoreRef {
+        self.root_store.clone()
     }
 
     fn config(&self) -> &LogStoreConfig {

@@ -5,11 +5,12 @@ use arrow_array::Array;
 use arrow_schema::TimeUnit;
 use chrono::{DateTime, TimeZone, Utc};
 use delta_kernel::{
+    engine::arrow_conversion::TryIntoKernel as _,
     expressions::{Scalar, StructData},
     schema::StructField,
 };
 use object_store::path::Path;
-#[cfg(test)]
+#[cfg(any(test, feature = "integration_test"))]
 use serde_json::Value;
 use urlencoding::encode;
 
@@ -24,7 +25,7 @@ pub trait ScalarExt: Sized {
     /// Create a [`Scalar`] from an arrow array row
     fn from_array(arr: &dyn Array, index: usize) -> Option<Self>;
     /// Serialize as serde_json::Value
-    #[cfg(test)]
+    #[cfg(any(test, feature = "integration_test"))]
     fn to_json(&self) -> serde_json::Value;
 }
 
@@ -48,23 +49,25 @@ impl ScalarExt for Scalar {
                 let date = DateTime::from_timestamp(*days as i64 * 24 * 3600, 0).unwrap();
                 date.format("%Y-%m-%d").to_string()
             }
-            Self::Decimal(value, _, scale) => match scale.cmp(&0) {
-                Ordering::Equal => value.to_string(),
+            Self::Decimal(decimal) => match decimal.scale().cmp(&0) {
+                Ordering::Equal => decimal.bits().to_string(),
                 Ordering::Greater => {
-                    let scalar_multiple = 10_i128.pow(*scale as u32);
+                    let scale = decimal.scale();
+                    let value = decimal.bits();
+                    let scalar_multiple = 10_i128.pow(scale as u32);
                     let mut s = String::new();
                     s.push_str((value / scalar_multiple).to_string().as_str());
                     s.push('.');
                     s.push_str(&format!(
                         "{:0>scale$}",
                         value % scalar_multiple,
-                        scale = *scale as usize
+                        scale = scale as usize
                     ));
                     s
                 }
                 Ordering::Less => {
-                    let mut s = value.to_string();
-                    for _ in 0..*scale {
+                    let mut s = decimal.bits().to_string();
+                    for _ in 0..decimal.scale() {
                         s.push('0');
                     }
                     s
@@ -74,6 +77,7 @@ impl ScalarExt for Scalar {
             Self::Null(_) => "null".to_string(),
             Self::Struct(_) => self.to_string(),
             Self::Array(_) => self.to_string(),
+            Self::Map(_) => self.to_string(),
         }
     }
 
@@ -94,7 +98,7 @@ impl ScalarExt for Scalar {
             return None;
         }
         if arr.is_null(index) {
-            return Some(Self::Null(arr.data_type().try_into().ok()?));
+            return Some(Self::Null(arr.data_type().try_into_kernel().ok()?));
         }
 
         match arr.data_type() {
@@ -170,12 +174,13 @@ impl ScalarExt for Scalar {
                 .as_any()
                 .downcast_ref::<Float64Array>()
                 .map(|v| Self::Double(v.value(index))),
-            Decimal128(precision, scale) => {
-                arr.as_any().downcast_ref::<Decimal128Array>().map(|v| {
+            Decimal128(precision, scale) => arr
+                .as_any()
+                .downcast_ref::<Decimal128Array>()
+                .and_then(|v| {
                     let value = v.value(index);
-                    Self::Decimal(value, *precision, *scale as u8)
-                })
-            }
+                    Self::decimal(value, *precision, *scale as u8).ok()
+                }),
             Date32 => arr
                 .as_any()
                 .downcast_ref::<Date32Array>()
@@ -191,7 +196,7 @@ impl ScalarExt for Scalar {
             Struct(fields) => {
                 let struct_fields = fields
                     .iter()
-                    .flat_map(|f| TryFrom::try_from(f.as_ref()))
+                    .flat_map(|f| f.as_ref().try_into_kernel())
                     .collect::<Vec<_>>();
                 let values = arr
                     .as_any()
@@ -232,7 +237,7 @@ impl ScalarExt for Scalar {
     }
 
     /// Serializes this scalar as a serde_json::Value.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "integration_test"))]
     fn to_json(&self) -> serde_json::Value {
         match self {
             Self::String(s) => Value::String(s.to_owned()),
@@ -251,23 +256,25 @@ impl ScalarExt for Scalar {
                 let date = DateTime::from_timestamp(*days as i64 * 24 * 3600, 0).unwrap();
                 Value::String(date.format("%Y-%m-%d").to_string())
             }
-            Self::Decimal(value, _, scale) => match scale.cmp(&0) {
-                Ordering::Equal => Value::String(value.to_string()),
+            Self::Decimal(decimal) => match decimal.scale().cmp(&0) {
+                Ordering::Equal => Value::String(decimal.bits().to_string()),
                 Ordering::Greater => {
-                    let scalar_multiple = 10_i128.pow(*scale as u32);
+                    let scale = decimal.scale();
+                    let value = decimal.bits();
+                    let scalar_multiple = 10_i128.pow(scale as u32);
                     let mut s = String::new();
                     s.push_str((value / scalar_multiple).to_string().as_str());
                     s.push('.');
                     s.push_str(&format!(
                         "{:0>scale$}",
                         value % scalar_multiple,
-                        scale = *scale as usize
+                        scale = scale as usize
                     ));
                     Value::String(s)
                 }
                 Ordering::Less => {
-                    let mut s = value.to_string();
-                    for _ in 0..*scale {
+                    let mut s = decimal.bits().to_string();
+                    for _ in 0..decimal.scale() {
                         s.push('0');
                     }
                     Value::String(s)
@@ -277,6 +284,7 @@ impl ScalarExt for Scalar {
             Self::Null(_) => Value::Null,
             Self::Struct(_) => unimplemented!(),
             Self::Array(_) => unimplemented!(),
+            Self::Map(_) => unimplemented!(),
         }
     }
 }

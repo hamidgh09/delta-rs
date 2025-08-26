@@ -40,7 +40,7 @@ async fn read_simple_table(integration: &IntegrationContext) -> TestResult {
         .load()
         .await?;
 
-    assert_eq!(table.version(), 4);
+    assert_eq!(table.version(), Some(4));
     assert_eq!(table.protocol()?.min_writer_version, 2);
     assert_eq!(table.protocol()?.min_reader_version, 1);
     assert_eq!(
@@ -55,7 +55,7 @@ async fn read_simple_table(integration: &IntegrationContext) -> TestResult {
     );
     let tombstones = table
         .snapshot()?
-        .all_tombstones(table.object_store().clone())
+        .all_tombstones(&table.log_store())
         .await?
         .collect::<Vec<_>>();
     assert_eq!(tombstones.len(), 31);
@@ -84,7 +84,7 @@ async fn read_simple_table_with_version(integration: &IntegrationContext) -> Tes
         .load()
         .await?;
 
-    assert_eq!(table.version(), 3);
+    assert_eq!(table.version(), Some(3));
     assert_eq!(table.protocol()?.min_writer_version, 2);
     assert_eq!(table.protocol()?.min_reader_version, 1);
     assert_eq!(
@@ -100,7 +100,7 @@ async fn read_simple_table_with_version(integration: &IntegrationContext) -> Tes
     );
     let tombstones = table
         .snapshot()?
-        .all_tombstones(table.object_store().clone())
+        .all_tombstones(&table.log_store())
         .await?
         .collect::<Vec<_>>();
     assert_eq!(tombstones.len(), 29);
@@ -129,7 +129,7 @@ pub async fn read_golden(integration: &IntegrationContext) -> TestResult {
         .await
         .unwrap();
 
-    assert_eq!(table.version(), 0);
+    assert_eq!(table.version(), Some(0));
     assert_eq!(table.protocol()?.min_writer_version, 2);
     assert_eq!(table.protocol()?.min_reader_version, 1);
 
@@ -165,7 +165,7 @@ async fn read_encoded_table(integration: &IntegrationContext, root_path: &str) -
         .load()
         .await?;
 
-    assert_eq!(table.version(), 0);
+    assert_eq!(table.version(), Some(0));
     assert_eq!(table.get_files_iter()?.count(), 2);
 
     Ok(())

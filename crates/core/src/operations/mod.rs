@@ -25,6 +25,7 @@ use self::filesystem_check::FileSystemCheckBuilder;
 use self::optimize::OptimizeBuilder;
 use self::restore::RestoreBuilder;
 use self::set_tbl_properties::SetTablePropertiesBuilder;
+use self::update_table_metadata::UpdateTableMetadataBuilder;
 use self::vacuum::VacuumBuilder;
 #[cfg(feature = "datafusion")]
 use self::{
@@ -45,11 +46,11 @@ pub mod create;
 pub mod drop_constraints;
 pub mod filesystem_check;
 pub mod restore;
-pub mod transaction;
 pub mod update_field_metadata;
+pub mod update_table_metadata;
 pub mod vacuum;
 
-#[cfg(all(feature = "cdf", feature = "datafusion"))]
+#[cfg(feature = "datafusion")]
 mod cdc;
 #[cfg(feature = "datafusion")]
 pub mod constraints;
@@ -131,7 +132,7 @@ impl DeltaOps {
     /// use deltalake_core::DeltaOps;
     ///
     /// async {
-    ///     let ops = DeltaOps::try_from_uri("memory://").await.unwrap();
+    ///     let ops = DeltaOps::try_from_uri("memory:///").await.unwrap();
     /// };
     /// ```
     pub async fn try_from_uri(uri: impl AsRef<str>) -> DeltaResult<Self> {
@@ -172,7 +173,7 @@ impl DeltaOps {
     /// ```
     #[must_use]
     pub fn new_in_memory() -> Self {
-        DeltaTableBuilder::from_uri("memory://")
+        DeltaTableBuilder::from_uri("memory:///")
             .build()
             .unwrap()
             .into()
@@ -184,9 +185,9 @@ impl DeltaOps {
     /// use deltalake_core::DeltaOps;
     ///
     /// async {
-    ///     let ops = DeltaOps::try_from_uri("memory://").await.unwrap();
+    ///     let ops = DeltaOps::try_from_uri("memory:///").await.unwrap();
     ///     let table = ops.create().with_table_name("my_table").await.unwrap();
-    ///     assert_eq!(table.version(), 0);
+    ///     assert_eq!(table.version(), Some(0));
     /// };
     /// ```
     #[must_use]
@@ -303,6 +304,11 @@ impl DeltaOps {
     /// Update field metadata
     pub fn update_field_metadata(self) -> UpdateFieldMetadataBuilder {
         UpdateFieldMetadataBuilder::new(self.0.log_store, self.0.state.unwrap())
+    }
+
+    /// Update table metadata
+    pub fn update_table_metadata(self) -> UpdateTableMetadataBuilder {
+        UpdateTableMetadataBuilder::new(self.0.log_store, self.0.state.unwrap())
     }
 }
 

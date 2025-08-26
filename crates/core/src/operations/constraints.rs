@@ -7,13 +7,17 @@ use datafusion::execution::{SendableRecordBatchStream, TaskContext};
 use datafusion::prelude::SessionContext;
 use datafusion_common::ToDFSchema;
 use datafusion_physical_plan::ExecutionPlan;
+use delta_kernel::table_features::WriterFeature;
 use futures::future::BoxFuture;
 use futures::StreamExt;
 
+use super::datafusion_utils::into_expr;
+use super::{CustomExecuteHandler, Operation};
 use crate::delta_datafusion::expr::fmt_expr_to_sql;
 use crate::delta_datafusion::{
     register_store, DeltaDataChecker, DeltaScanBuilder, DeltaSessionContext,
 };
+use crate::kernel::transaction::{CommitBuilder, CommitProperties};
 use crate::kernel::Protocol;
 use crate::logstore::LogStoreRef;
 use crate::operations::datafusion_utils::Expression;
@@ -21,11 +25,6 @@ use crate::protocol::DeltaOperation;
 use crate::table::state::DeltaTableState;
 use crate::table::Constraint;
 use crate::{DeltaResult, DeltaTable, DeltaTableError};
-use delta_kernel::table_features::WriterFeatures;
-
-use super::datafusion_utils::into_expr;
-use super::transaction::{CommitBuilder, CommitProperties};
-use super::{CustomExecuteHandler, Operation};
 
 /// Build a constraint to add to a table
 pub struct ConstraintBuilder {
@@ -201,7 +200,7 @@ impl std::future::IntoFuture for ConstraintBuilder {
                 } else {
                     let current_features = old_protocol.writer_features.clone();
                     if let Some(mut features) = current_features {
-                        features.insert(WriterFeatures::CheckConstraints);
+                        features.insert(WriterFeature::CheckConstraints);
                         Some(features)
                     } else {
                         current_features
@@ -327,7 +326,7 @@ mod tests {
             .with_constraint("id", "value <    1000")
             .await?;
         let version = table.version();
-        assert_eq!(version, 1);
+        assert_eq!(version, Some(1));
 
         let expected_expr = "value < 1000";
         assert_eq!(get_constraint_op_params(&mut table).await, expected_expr);
@@ -352,7 +351,7 @@ mod tests {
             .with_constraint("valid_values", col("value").lt(lit(1000)))
             .await?;
         let version = table.version();
-        assert_eq!(version, 1);
+        assert_eq!(version, Some(1));
 
         let expected_expr = "value < 1000";
         assert_eq!(get_constraint_op_params(&mut table).await, expected_expr);
@@ -368,7 +367,7 @@ mod tests {
     async fn test_constraint_case_sensitive() -> DeltaResult<()> {
         let arrow_schema = Arc::new(ArrowSchema::new(vec![
             Field::new("Id", ArrowDataType::Utf8, true),
-            Field::new("vAlue", ArrowDataType::Int32, true),
+            Field::new("vAlue", ArrowDataType::Int32, true), // spellchecker:disable-line
             Field::new("mOdifieD", ArrowDataType::Utf8, true),
         ]));
 
@@ -390,12 +389,12 @@ mod tests {
 
         let mut table = DeltaOps(table)
             .add_constraint()
-            .with_constraint("valid_values", "vAlue < 1000")
+            .with_constraint("valid_values", "vAlue < 1000") // spellchecker:disable-line
             .await?;
         let version = table.version();
-        assert_eq!(version, 1);
+        assert_eq!(version, Some(1));
 
-        let expected_expr = "vAlue < 1000";
+        let expected_expr = "\"vAlue\" < 1000"; // spellchecker:disable-line
         assert_eq!(get_constraint_op_params(&mut table).await, expected_expr);
         assert_eq!(
             get_constraint(&table, "delta.constraints.valid_values"),

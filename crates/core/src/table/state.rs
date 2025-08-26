@@ -1,11 +1,10 @@
 //! The module for delta table state.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
 
 use chrono::Utc;
 use futures::TryStreamExt;
-use object_store::{path::Path, ObjectStore};
+use object_store::path::Path;
 use serde::{Deserialize, Serialize};
 
 use super::{config::TableConfig, get_partition_col_data_types, DeltaTableConfig};
@@ -13,7 +12,7 @@ use super::{config::TableConfig, get_partition_col_data_types, DeltaTableConfig}
 use crate::kernel::Action;
 use crate::kernel::{
     ActionType, Add, AddCDCFile, DataType, EagerSnapshot, LogDataHandler, LogicalFile, Metadata,
-    Protocol, Remove, StructType, Transaction,
+    Protocol, Remove, StructType,
 };
 use crate::logstore::LogStore;
 use crate::partitions::{DeltaTablePartition, PartitionFilter};
@@ -29,14 +28,12 @@ pub struct DeltaTableState {
 impl DeltaTableState {
     /// Create a new DeltaTableState
     pub async fn try_new(
-        table_root: &Path,
-        store: Arc<dyn ObjectStore>,
+        log_store: &dyn LogStore,
         config: DeltaTableConfig,
         version: Option<i64>,
     ) -> DeltaResult<Self> {
         let snapshot = EagerSnapshot::try_new_with_visitor(
-            table_root,
-            store.clone(),
+            log_store,
             config,
             version,
             HashSet::from([ActionType::Txn]),
@@ -59,8 +56,8 @@ impl DeltaTableState {
 
     /// Construct a delta table state object from a list of actions
     #[cfg(test)]
-    pub fn from_actions(actions: Vec<Action>) -> DeltaResult<Self> {
-        use crate::operations::transaction::CommitData;
+    pub fn from_actions(actions: Vec<Action>, table_root: &Path) -> DeltaResult<Self> {
+        use crate::kernel::transaction::CommitData;
         use crate::protocol::{DeltaOperation, SaveMode};
 
         let metadata = actions
@@ -90,7 +87,7 @@ impl DeltaTableState {
             Vec::new(),
         )];
 
-        let snapshot = EagerSnapshot::new_test(&commit_data).unwrap();
+        let snapshot = EagerSnapshot::new_test(&commit_data, table_root).unwrap();
         Ok(Self { snapshot })
     }
 
@@ -102,12 +99,12 @@ impl DeltaTableState {
     /// Full list of tombstones (remove actions) representing files removed from table state).
     pub async fn all_tombstones(
         &self,
-        store: Arc<dyn ObjectStore>,
+        log_store: &dyn LogStore,
     ) -> DeltaResult<impl Iterator<Item = Remove>> {
         Ok(self
             .snapshot
             .snapshot()
-            .tombstones(store)?
+            .tombstones(log_store)?
             .try_collect::<Vec<_>>()
             .await?
             .into_iter()
@@ -118,14 +115,14 @@ impl DeltaTableState {
     /// The retention period is set by `deletedFileRetentionDuration` with default value of 1 week.
     pub async fn unexpired_tombstones(
         &self,
-        store: Arc<dyn ObjectStore>,
+        log_store: &dyn LogStore,
     ) -> DeltaResult<impl Iterator<Item = Remove>> {
         let retention_timestamp = Utc::now().timestamp_millis()
             - self
                 .table_config()
                 .deleted_file_retention_duration()
                 .as_millis() as i64;
-        let tombstones = self.all_tombstones(store).await?.collect::<Vec<_>>();
+        let tombstones = self.all_tombstones(log_store).await?.collect::<Vec<_>>();
         Ok(tombstones
             .into_iter()
             .filter(move |t| t.deletion_timestamp.unwrap_or(0) > retention_timestamp))
@@ -161,9 +158,15 @@ impl DeltaTableState {
             .map(|add| add.object_store_path())
     }
 
-    /// HashMap containing the last transaction stored for every application.
-    pub fn app_transaction_version(&self) -> DeltaResult<impl Iterator<Item = Transaction> + '_> {
-        self.snapshot.transactions()
+    /// Get the transaction version for the given application ID.
+    ///
+    /// Returns `None` if the application ID is not found.
+    pub async fn transaction_version(
+        &self,
+        _log_store: &dyn LogStore,
+        app_id: impl AsRef<str>,
+    ) -> DeltaResult<Option<i64>> {
+        self.snapshot.transaction_version(app_id).await
     }
 
     /// The most recent protocol of the table.
@@ -199,7 +202,7 @@ impl DeltaTableState {
     /// Update the state of the table to the given version.
     pub async fn update(
         &mut self,
-        log_store: Arc<dyn LogStore>,
+        log_store: &dyn LogStore,
         version: Option<i64>,
     ) -> Result<(), DeltaTableError> {
         self.snapshot.update(log_store, version).await?;

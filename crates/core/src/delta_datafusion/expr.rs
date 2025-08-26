@@ -333,7 +333,7 @@ impl Display for BinaryExprFormat<'_> {
 impl Display for SqlFormat<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self.expr {
-            Expr::Column(c) => write!(f, "{c}"),
+            Expr::Column(c) => write!(f, "{}", c.quoted_flat_name()),
             Expr::Literal(v) => write!(f, "{}", ScalarValueFormat { scalar: v }),
             Expr::Case(case) => {
                 write!(f, "CASE ")?;
@@ -638,7 +638,7 @@ mod test {
             ),
             StructField::new(
                 "money".to_string(),
-                DataType::Primitive(PrimitiveType::Decimal(12, 2)),
+                DataType::Primitive(PrimitiveType::decimal(12, 2).unwrap()),
                 true,
             ),
             StructField::new(
@@ -663,7 +663,7 @@ mod test {
             ),
             StructField::new(
                 "_decimal".to_string(),
-                DataType::Primitive(PrimitiveType::Decimal(2, 2)),
+                DataType::Primitive(PrimitiveType::decimal(2, 2).unwrap()),
                 true,
             ),
             StructField::new(
@@ -697,7 +697,7 @@ mod test {
             .with_columns(schema.fields().cloned())
             .await
             .unwrap();
-        assert_eq!(table.version(), 0);
+        assert_eq!(table.version(), Some(0));
         table
     }
 
@@ -727,7 +727,7 @@ mod test {
             },
             simple!(
                 Expr::Column(Column::from_qualified_name_ignore_case("Value3")).eq(lit(3_i64)),
-                "Value3 = 3".to_string()
+                "\"Value3\" = 3".to_string()
             ),
             simple!(col("active").is_true(), "active IS TRUE".to_string()),
             simple!(col("active"), "active".to_string()),
