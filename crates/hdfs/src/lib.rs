@@ -5,7 +5,6 @@ use deltalake_core::logstore::{
     default_logstore, logstore_factories, DeltaIOStorageBackend, LogStore, LogStoreFactory,
     StorageConfig,
 };
-
 use deltalake_core::logstore::{object_store_factories, ObjectStoreFactory, ObjectStoreRef};
 use deltalake_core::{DeltaResult, Path};
 use hdfs_native_object_store::HdfsObjectStore;
@@ -20,16 +19,16 @@ impl ObjectStoreFactory for HdfsFactory {
     fn parse_url_opts(
         &self,
         url: &Url,
-        options: &HashMap<String, String>,
-        _retry: &RetryConfig,
-        handle: Option<Handle>,
+        config: &StorageConfig,
     ) -> DeltaResult<(ObjectStoreRef, Path)> {
-        let mut store: ObjectStoreRef =
-            Arc::new(HdfsObjectStore::with_config(url.as_str(), options.clone())?);
+        let mut store: ObjectStoreRef = Arc::new(HdfsObjectStore::with_config(
+            url.as_str(),
+            config.raw.clone(),
+        )?);
 
         // HDFS doesn't have the spawnService, so we still wrap it in the old io storage backend (not as optimal though)
-        if let Some(handle) = handle {
-            store = Arc::new(DeltaIOStorageBackend::new(store, handle));
+        if let Some(runtime) = &config.runtime {
+            store = Arc::new(DeltaIOStorageBackend::new(store, runtime.clone()));
         };
         let prefix = Path::parse(url.path())?;
         Ok((store, prefix))
@@ -72,9 +71,7 @@ mod tests {
         let factory = HdfsFactory::default();
         let _ = factory.parse_url_opts(
             &Url::parse("hdfs://localhost:9000").expect("Failed to parse hdfs://"),
-            &HashMap::default(),
-            &RetryConfig::default(),
-            None,
+            &StorageConfig::default(),
         )?;
         Ok(())
     }

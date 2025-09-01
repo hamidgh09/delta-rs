@@ -1,6 +1,6 @@
 [package]
 name = "deltalake-python"
-version = "1.0.2-post1"
+version = "1.1.2-post1"
 authors = ["Hamid Ghasemirahni <hamid@logicalclocks.com>", "Salman Niazi <salman@logicalclocks.com>"]
 homepage = "https://github.com/logicalclocks/delta-rs"
 license = "Apache-2.0"
@@ -24,10 +24,7 @@ arrow-schema = { workspace = true, features = ["serde"] }
 
 # datafusion
 # datafusion-catalog = { workspace = true }
-datafusion-expr = { workspace = true }
 datafusion-ffi = { workspace = true }
-datafusion-physical-expr = { workspace = true }
-datafusion-physical-plan = { workspace = true }
 
 # serde
 serde = { workspace = true }
