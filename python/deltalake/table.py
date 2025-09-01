@@ -119,6 +119,11 @@ class Metadata:
         )
 
 
+class DeltaTableConfig(NamedTuple):
+    without_files: bool
+    log_buffer_size: int
+
+
 class ProtocolVersions(NamedTuple):
     min_reader_version: int
     min_writer_version: int
@@ -165,6 +170,10 @@ class DeltaTable:
             without_files=without_files,
             log_buffer_size=log_buffer_size,
         )
+
+    @property
+    def table_config(self) -> DeltaTableConfig:
+        return DeltaTableConfig(*self._table.table_config())
 
     @staticmethod
     def is_deltatable(
@@ -871,6 +880,12 @@ class DeltaTable:
                 self.schema().to_arrow(as_large_types=as_large_types)
             )
 
+        if partitions:
+            partitions = [
+                (column, operator, encode_partition_value(value))
+                for column, operator, value in partitions
+            ]
+
         fragments = [
             format.make_fragment(
                 file,
@@ -954,6 +969,9 @@ class DeltaTable:
         self._table.update_incremental()
 
     def create_checkpoint(self) -> None:
+        """
+        Create a checkpoint at the current table version.
+        """
         self._table.create_checkpoint()
 
     def cleanup_metadata(self) -> None:
