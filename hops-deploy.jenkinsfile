@@ -44,7 +44,7 @@ pipeline {
                         cat $REPO_CREDS > id_rsa
                         chmod 600 id_rsa
                         echo "uploading on repo.hops.works ..."
-                        scp -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -i ./id_rsa target/wheels/deltalake*.whl ${DST_DIR}
+                        scp -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -i ./id_rsa target/wheels/hops_deltalake*.whl ${DST_DIR}
                         rm -f id_rsa
                     """
                 }

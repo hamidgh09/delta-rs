@@ -1,10 +1,10 @@
 [package]
 name = "deltalake-python"
 version = "1.0.2-post1"
-authors = ["Qingping Hou <dave2008713@gmail.com>", "Will Jones <willjones127@gmail.com>"]
-homepage = "https://github.com/delta-io/delta-rs"
+authors = ["Hamid Ghasemirahni <hamid@logicalclocks.com>", "Salman Niazi <salman@logicalclocks.com>"]
+homepage = "https://github.com/logicalclocks/delta-rs"
 license = "Apache-2.0"
-description = "Native Delta Lake Python binding based on delta-rs with Pandas integration"
+description = "HopsFS compatible version of Native Delta Lake Python binding based on delta-rs with Pandas integration"
 readme = "README.md"
 edition = "2021"
 keywords = ["deltalake", "delta", "datalake", "pandas", "arrow"]
