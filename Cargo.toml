@@ -26,45 +26,43 @@ debug = true
 debug = "line-tables-only"
 
 [workspace.dependencies]
-delta_kernel = { version = "0.8.0", features = ["arrow_54"] }
-#delta_kernel = { path = "../delta-kernel-rs/kernel", features = ["sync-engine"]  }
+delta_kernel = { version = "0.11.0", features = ["arrow-55", "internal-api"] }
 
 # arrow
-arrow = { version = "54" }
-arrow-arith = { version = "54" }
-arrow-array = { version = "54", features = ["chrono-tz"] }
-arrow-buffer = { version = "54" }
-arrow-cast = { version = "54" }
-arrow-ipc = { version = "54" }
-arrow-json = { version = "54" }
-arrow-ord = { version = "54" }
-arrow-row = { version = "54" }
-arrow-schema = { version = "54" }
-arrow-select = { version = "54" }
-object_store = { version = "0.11.2" }
-parquet = { version = "54" }
+arrow = { version = "=55.0.0" }
+arrow-arith = { version = "=55.0.0" }
+arrow-array = { version = "=55.0.0", features = ["chrono-tz"] }
+arrow-buffer = { version = "=55.0.0" }
+arrow-cast = { version = "=55.0.0" }
+arrow-ipc = { version = "=55.0.0" }
+arrow-json = { version = "=55.0.0" }
+arrow-ord = { version = "=55.0.0" }
+arrow-row = { version = "=55.0.0" }
+arrow-schema = { version = "=55.0.0" }
+arrow-select = { version = "=55.0.0" }
+object_store = { version = "0.12.1" }
+parquet = { version = "=55.0.0" }
 
 # datafusion
-datafusion = "46"
-datafusion-expr = "46"
-datafusion-common = "46"
-datafusion-ffi = "46"
-datafusion-functions = "46"
-datafusion-functions-aggregate = "46"
-datafusion-physical-expr = "46"
-datafusion-physical-plan = "46"
-datafusion-proto = "46"
-datafusion-sql = "46"
+datafusion = "47.0.0"
+datafusion-expr = "47.0.0"
+datafusion-common = "47.0.0"
+datafusion-ffi = "47.0.0"
+datafusion-functions = "47.0.0"
+datafusion-functions-aggregate = "47.0.0"
+datafusion-physical-expr = "47.0.0"
+datafusion-physical-plan = "47.0.0"
+datafusion-proto = "47.0.0"
+datafusion-sql = "47.0.0"
 
 # serde
 serde = { version = "1.0.194", features = ["derive"] }
 serde_json = "1"
-strum = { version = "0.26"}
-
+strum = { version = "0.27" }
 
 # "stdlib"
 bytes = { version = "1" }
-chrono = { version = "=0.4.39", default-features = false, features = ["clock"] }
+chrono = { version = "0.4.40", default-features = false, features = ["clock"] }
 tracing = { version = "0.1", features = ["log"] }
 regex = { version = "1" }
 thiserror = { version = "2" }
@@ -77,3 +75,21 @@ async-trait = { version = "0.1" }
 futures = { version = "0.3" }
 tokio = { version = "1" }
 num_cpus = { version = "1" }
+
+[workspace.metadata.typos]
+default.extend-ignore-re = [
+    # Custom ignore regex patterns: https://github.com/crate-ci/typos/blob/master/docs/reference.md#example-configurations
+    "(?s)//\\s*spellchecker:ignore-next-line[^\\n]*\\n[^\\n]*",
+    # Line block with # spellchecker:<on|off>
+    "(?s)(#|//|<\\!--)\\s*spellchecker:off.*?\\n\\s*(#|//|<\\!--)\\s*spellchecker:on",
+    "(?Rm)^.*(#|//)\\s*spellchecker:disable-line$",
+    # workaround for: https://github.com/crate-ci/typos/issues/850
+    "[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}",
+]
+
+[workspace.metadata.typos.default.extend-words]
+arro = "arro"
+Arro = "Arro"
+arro3 = "arro3"
+Arro3 = "Arro3"
+AKS = "AKS"

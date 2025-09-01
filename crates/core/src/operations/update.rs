@@ -45,32 +45,26 @@ use serde::Serialize;
 use tracing::log::*;
 use uuid::Uuid;
 
-use super::{
-    datafusion_utils::Expression,
-    transaction::{CommitBuilder, CommitProperties},
-};
-use super::{transaction::PROTOCOL, write::WriterStatsConfig};
+use super::datafusion_utils::Expression;
+use super::write::WriterStatsConfig;
 use super::{
     write::execution::{write_execution_plan, write_execution_plan_cdc},
     CustomExecuteHandler, Operation,
 };
+use crate::delta_datafusion::{
+    expr::fmt_expr_to_sql,
+    logical::MetricObserver,
+    physical::{find_metric_node, get_metric, MetricObserverExec},
+    DataFusionMixins, DeltaColumn, DeltaScanConfigBuilder, DeltaSessionContext, DeltaTableProvider,
+};
 use crate::delta_datafusion::{find_files, planner::DeltaPlanner, register_store};
+use crate::kernel::transaction::{CommitBuilder, CommitProperties, PROTOCOL};
 use crate::kernel::{Action, Remove};
 use crate::logstore::LogStoreRef;
 use crate::operations::cdc::*;
 use crate::protocol::DeltaOperation;
 use crate::table::state::DeltaTableState;
-use crate::{
-    delta_datafusion::{
-        expr::fmt_expr_to_sql,
-        logical::MetricObserver,
-        physical::{find_metric_node, get_metric, MetricObserverExec},
-        DataFusionMixins, DeltaColumn, DeltaScanConfigBuilder, DeltaSessionContext,
-        DeltaTableProvider,
-    },
-    DeltaTableError,
-};
-use crate::{DeltaResult, DeltaTable};
+use crate::{DeltaResult, DeltaTable, DeltaTableError};
 
 /// Custom column name used for marking internal [RecordBatch] rows as updated
 pub(crate) const UPDATE_PREDICATE_COLNAME: &str = "__delta_rs_update_predicate";
@@ -377,7 +371,9 @@ async fn execute(
 
     //let updated_df = df_with_predicate_and_metrics.clone();
     // Disabling the select allows the coerce test to pass, still not sure why
-    let updated_df = df_with_predicate_and_metrics.select(expressions.clone())?;
+    let updated_df = df_with_predicate_and_metrics
+        .select(expressions.clone())?
+        .drop_columns(&[UPDATE_PREDICATE_COLNAME])?;
     let physical_plan = updated_df.clone().create_physical_plan().await?;
     let writer_stats_config = WriterStatsConfig::new(
         snapshot.table_config().num_indexed_cols(),
@@ -387,7 +383,7 @@ async fn execute(
             .map(|v| v.iter().map(|v| v.to_string()).collect::<Vec<String>>()),
     );
 
-    let tracker = CDCTracker::new(df, updated_df.drop_columns(&[UPDATE_PREDICATE_COLNAME])?);
+    let tracker = CDCTracker::new(df, updated_df);
 
     let add_actions = write_execution_plan(
         Some(&snapshot),
@@ -554,6 +550,7 @@ mod tests {
     use arrow_schema::DataType;
     use datafusion::assert_batches_sorted_eq;
     use datafusion::prelude::*;
+    use delta_kernel::engine::arrow_conversion::TryIntoArrow;
     use serde_json::json;
     use std::sync::Arc;
 
@@ -566,7 +563,7 @@ mod tests {
             .with_partition_columns(partitions.unwrap_or_default())
             .await
             .unwrap();
-        assert_eq!(table.version(), 0);
+        assert_eq!(table.version(), Some(0));
         table
     }
 
@@ -605,6 +602,55 @@ mod tests {
             .expect_err("Remove action is included when Delta table is append-only. Should error");
     }
 
+    // <https://github.com/delta-io/delta-rs/issues/3414>
+    #[tokio::test]
+    async fn test_update_predicate_left_in_data() -> DeltaResult<()> {
+        let schema = get_arrow_schema(&None);
+        let table = setup_table(None).await;
+
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(arrow::array::StringArray::from(vec!["A", "B", "A", "A"])),
+                Arc::new(arrow::array::Int32Array::from(vec![1, 10, 10, 100])),
+                Arc::new(arrow::array::StringArray::from(vec![
+                    "2021-02-02",
+                    "2021-02-02",
+                    "2021-02-02",
+                    "2021-02-02",
+                ])),
+            ],
+        )?;
+
+        let table = write_batch(table, batch).await;
+        assert_eq!(table.version(), Some(1));
+
+        let (table, _) = DeltaOps(table)
+            .update()
+            .with_update("modified", lit("2023-05-14"))
+            .with_predicate(col("value").eq(lit(10)))
+            .await?;
+
+        use parquet::arrow::async_reader::ParquetObjectReader;
+        use parquet::arrow::async_reader::ParquetRecordBatchStreamBuilder;
+
+        for pq in table.get_files_iter()? {
+            let store = table.log_store().object_store(None);
+            let reader = ParquetObjectReader::new(store, pq);
+            let builder = ParquetRecordBatchStreamBuilder::new(reader).await?;
+            let schema = builder.schema();
+
+            assert!(
+                schema
+                    .field_with_name("__delta_rs_update_predicate")
+                    .is_err(),
+                "The schema contains __delta_rs_update_predicate which is incorrect!"
+            );
+            assert_eq!(schema.fields.len(), 3, "Expected the Parquet file to only have three fields in the schema, something is amiss!");
+        }
+        Ok(())
+    }
+
     #[tokio::test]
     async fn test_update_no_predicate() {
         let schema = get_arrow_schema(&None);
@@ -626,7 +672,7 @@ mod tests {
         .unwrap();
 
         let table = write_batch(table, batch).await;
-        assert_eq!(table.version(), 1);
+        assert_eq!(table.version(), Some(1));
         assert_eq!(table.get_files_count(), 1);
 
         let (table, metrics) = DeltaOps(table)
@@ -635,7 +681,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(table.version(), 2);
+        assert_eq!(table.version(), Some(2));
         assert_eq!(table.get_files_count(), 1);
         assert_eq!(metrics.num_added_files, 1);
         assert_eq!(metrics.num_removed_files, 1);
@@ -680,7 +726,7 @@ mod tests {
         // The expectation is that a physical scan of data is not required
 
         let table = write_batch(table, batch).await;
-        assert_eq!(table.version(), 1);
+        assert_eq!(table.version(), Some(1));
         assert_eq!(table.get_files_count(), 1);
 
         let (table, metrics) = DeltaOps(table)
@@ -690,7 +736,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(table.version(), 2);
+        assert_eq!(table.version(), Some(2));
         assert_eq!(table.get_files_count(), 1);
         assert_eq!(metrics.num_added_files, 1);
         assert_eq!(metrics.num_removed_files, 1);
@@ -737,7 +783,7 @@ mod tests {
         .unwrap();
 
         let table = write_batch(table, batch.clone()).await;
-        assert_eq!(table.version(), 1);
+        assert_eq!(table.version(), Some(1));
         assert_eq!(table.get_files_count(), 2);
 
         let (table, metrics) = DeltaOps(table)
@@ -748,7 +794,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(table.version(), 2);
+        assert_eq!(table.version(), Some(2));
         assert_eq!(table.get_files_count(), 2);
         assert_eq!(metrics.num_added_files, 1);
         assert_eq!(metrics.num_removed_files, 1);
@@ -772,7 +818,7 @@ mod tests {
         // Update a partitioned table where the predicate contains a partition column and non-partition column
         let table = setup_table(Some(vec!["modified"])).await;
         let table = write_batch(table, batch).await;
-        assert_eq!(table.version(), 1);
+        assert_eq!(table.version(), Some(1));
         assert_eq!(table.get_files_count(), 2);
 
         let (table, metrics) = DeltaOps(table)
@@ -787,7 +833,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(table.version(), 2);
+        assert_eq!(table.version(), Some(2));
         assert_eq!(table.get_files_count(), 3);
         assert_eq!(metrics.num_added_files, 2);
         assert_eq!(metrics.num_removed_files, 1);
@@ -818,7 +864,7 @@ mod tests {
                 true,
             ),
             StructField::new(
-                "ValUe".to_string(),
+                "ValUe".to_string(), // spellchecker:disable-line
                 DeltaDataType::Primitive(PrimitiveType::Integer),
                 true,
             ),
@@ -831,7 +877,7 @@ mod tests {
 
         let arrow_schema = Arc::new(ArrowSchema::new(vec![
             Field::new("Id", DataType::Utf8, true),
-            Field::new("ValUe", DataType::Int32, true),
+            Field::new("ValUe", DataType::Int32, true), // spellchecker:disable-line
             Field::new("mOdified", DataType::Utf8, true),
         ]));
 
@@ -867,7 +913,7 @@ mod tests {
 
         let expected = vec![
             "+----+-------+------------+",
-            "| Id | ValUe | mOdified   |",
+            "| Id | ValUe | mOdified   |", // spellchecker:disable-line
             "+----+-------+------------+",
             "| A  | 1     | 2021-02-02 |",
             "| B  | 10    | 2021-02-02 |",
@@ -883,7 +929,7 @@ mod tests {
     #[tokio::test]
     async fn test_update_null() {
         let table = prepare_values_table().await;
-        assert_eq!(table.version(), 0);
+        assert_eq!(table.version(), Some(0));
         assert_eq!(table.get_files_count(), 1);
 
         let (table, metrics) = DeltaOps(table)
@@ -891,7 +937,7 @@ mod tests {
             .with_update("value", col("value") + lit(1))
             .await
             .unwrap();
-        assert_eq!(table.version(), 1);
+        assert_eq!(table.version(), Some(1));
         assert_eq!(table.get_files_count(), 1);
         assert_eq!(metrics.num_added_files, 1);
         assert_eq!(metrics.num_removed_files, 1);
@@ -921,7 +967,7 @@ mod tests {
             .with_update("value", lit(10))
             .await
             .unwrap();
-        assert_eq!(table.version(), 1);
+        assert_eq!(table.version(), Some(1));
         assert_eq!(table.get_files_count(), 1);
         assert_eq!(metrics.num_added_files, 1);
         assert_eq!(metrics.num_removed_files, 1);
@@ -957,7 +1003,7 @@ mod tests {
             .with_update("value", "10")
             .await
             .unwrap();
-        assert_eq!(table.version(), 1);
+        assert_eq!(table.version(), Some(1));
         assert_eq!(table.get_files_count(), 1);
         assert_eq!(metrics.num_added_files, 1);
         assert_eq!(metrics.num_removed_files, 1);
@@ -985,7 +1031,7 @@ mod tests {
         let table = prepare_values_table().await;
         let (table, metrics) = DeltaOps(table).update().await.unwrap();
 
-        assert_eq!(table.version(), 0);
+        assert_eq!(table.version(), Some(0));
         assert_eq!(metrics.num_added_files, 0);
         assert_eq!(metrics.num_removed_files, 0);
         assert_eq!(metrics.num_copied_rows, 0);
@@ -1001,7 +1047,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(table.version(), 0);
+        assert_eq!(table.version(), Some(0));
         assert_eq!(metrics.num_added_files, 0);
         assert_eq!(metrics.num_removed_files, 0);
         assert_eq!(metrics.num_copied_rows, 0);
@@ -1055,7 +1101,7 @@ mod tests {
                 true,
             ),
         ]);
-        let arrow_schema: ArrowSchema = (&schema).try_into().unwrap();
+        let arrow_schema: ArrowSchema = (&schema).try_into_arrow().unwrap();
 
         // Create the first batch
         let arrow_field = Field::new("element", DataType::Int32, false);
@@ -1075,13 +1121,13 @@ mod tests {
             .with_columns(schema.fields().cloned())
             .await
             .unwrap();
-        assert_eq!(table.version(), 0);
+        assert_eq!(table.version(), Some(0));
 
         let table = DeltaOps(table)
             .write(vec![batch])
             .await
             .expect("Failed to write first batch");
-        assert_eq!(table.version(), 1);
+        assert_eq!(table.version(), Some(1));
         // Completed the first creation/write
 
         use arrow::array::{Int32Builder, ListBuilder};
@@ -1096,7 +1142,7 @@ mod tests {
             .with_update("items", lit(new_items))
             .await
             .unwrap();
-        assert_eq!(table.version(), 2);
+        assert_eq!(table.version(), Some(2));
     }
 
     /// Lists coming in from the Python bindings need to be parsed as SQL expressions by the update
@@ -1125,7 +1171,7 @@ mod tests {
                 true,
             ),
         ]);
-        let arrow_schema: ArrowSchema = (&schema).try_into().unwrap();
+        let arrow_schema: ArrowSchema = (&schema).try_into_arrow().unwrap();
 
         // Create the first batch
         let arrow_field = Field::new("element", DataType::Int64, true);
@@ -1146,13 +1192,13 @@ mod tests {
             .with_columns(schema.fields().cloned())
             .await
             .unwrap();
-        assert_eq!(table.version(), 0);
+        assert_eq!(table.version(), Some(0));
 
         let table = DeltaOps(table)
             .write(vec![batch])
             .await
             .expect("Failed to write first batch");
-        assert_eq!(table.version(), 1);
+        assert_eq!(table.version(), Some(1));
         // Completed the first creation/write
 
         let (table, _metrics) = DeltaOps(table)
@@ -1161,13 +1207,13 @@ mod tests {
             .with_update("items", "[100]".to_string())
             .await
             .unwrap();
-        assert_eq!(table.version(), 2);
+        assert_eq!(table.version(), Some(2));
     }
 
     #[tokio::test]
     async fn test_no_cdc_on_older_tables() {
         let table = prepare_values_table().await;
-        assert_eq!(table.version(), 0);
+        assert_eq!(table.version(), Some(0));
         assert_eq!(table.get_files_count(), 1);
 
         let schema = Arc::new(Schema::new(vec![Field::new(
@@ -1184,7 +1230,7 @@ mod tests {
             .write(vec![batch])
             .await
             .expect("Failed to write first batch");
-        assert_eq!(table.version(), 1);
+        assert_eq!(table.version(), Some(1));
 
         let (table, _metrics) = DeltaOps(table)
             .update()
@@ -1192,7 +1238,7 @@ mod tests {
             .with_update("value", lit(12))
             .await
             .unwrap();
-        assert_eq!(table.version(), 2);
+        assert_eq!(table.version(), Some(2));
 
         // NOTE: This currently doesn't really assert anything because cdc_files() is not reading
         // actions correct
@@ -1209,7 +1255,7 @@ mod tests {
 
         // Too close for missiles, switching to guns. Just checking that the data wasn't actually
         // written instead!
-        if let Ok(files) = crate::storage::utils::flatten_list_stream(
+        if let Ok(files) = crate::logstore::tests::flatten_list_stream(
             &table.object_store(),
             Some(&object_store::path::Path::from("_change_data")),
         )
@@ -1241,7 +1287,7 @@ mod tests {
             .with_configuration_property(TableProperty::EnableChangeDataFeed, Some("true"))
             .await
             .unwrap();
-        assert_eq!(table.version(), 0);
+        assert_eq!(table.version(), Some(0));
 
         let schema = Arc::new(Schema::new(vec![Field::new(
             "value",
@@ -1258,7 +1304,7 @@ mod tests {
             .write(vec![batch])
             .await
             .expect("Failed to write first batch");
-        assert_eq!(table.version(), 1);
+        assert_eq!(table.version(), Some(1));
 
         let (table, _metrics) = DeltaOps(table)
             .update()
@@ -1266,7 +1312,7 @@ mod tests {
             .with_update("value", lit(12))
             .await
             .unwrap();
-        assert_eq!(table.version(), 2);
+        assert_eq!(table.version(), Some(2));
 
         let ctx = SessionContext::new();
         let table = DeltaOps(table)
@@ -1325,7 +1371,7 @@ mod tests {
             .with_configuration_property(TableProperty::EnableChangeDataFeed, Some("true"))
             .await
             .unwrap();
-        assert_eq!(table.version(), 0);
+        assert_eq!(table.version(), Some(0));
 
         let schema = Arc::new(Schema::new(vec![
             Field::new("year", DataType::Utf8, true),
@@ -1348,7 +1394,7 @@ mod tests {
             .write(vec![batch])
             .await
             .expect("Failed to write first batch");
-        assert_eq!(table.version(), 1);
+        assert_eq!(table.version(), Some(1));
 
         let (table, _metrics) = DeltaOps(table)
             .update()
@@ -1356,7 +1402,7 @@ mod tests {
             .with_update("year", "2024")
             .await
             .unwrap();
-        assert_eq!(table.version(), 2);
+        assert_eq!(table.version(), Some(2));
 
         let ctx = SessionContext::new();
         let table = DeltaOps(table)

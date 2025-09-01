@@ -125,7 +125,9 @@ impl ExecutionPlan for MergeBarrierExec {
 impl DisplayAs for MergeBarrierExec {
     fn fmt_as(&self, t: DisplayFormatType, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         match t {
-            DisplayFormatType::Default | DisplayFormatType::Verbose => {
+            DisplayFormatType::Default
+            | DisplayFormatType::Verbose
+            | DisplayFormatType::TreeRender => {
                 write!(f, "MergeBarrier",)?;
                 Ok(())
             }
@@ -421,15 +423,6 @@ impl UserDefinedLogicalNodeCore for MergeBarrier {
         write!(f, "MergeBarrier")
     }
 
-    fn from_template(
-        &self,
-        exprs: &[datafusion_expr::Expr],
-        inputs: &[datafusion_expr::LogicalPlan],
-    ) -> Self {
-        self.with_exprs_and_inputs(exprs.to_vec(), inputs.to_vec())
-            .unwrap()
-    }
-
     fn with_exprs_and_inputs(
         &self,
         exprs: Vec<datafusion_expr::Expr>,
@@ -668,8 +661,8 @@ mod tests {
             MergeBarrierExec::new(exec, Arc::new("__delta_rs_path".to_string()), repartition);
 
         let survivors = merge.survivors();
-        let coalsece = CoalesceBatchesExec::new(Arc::new(merge), 100);
-        let mut stream = coalsece.execute(0, task_ctx).unwrap();
+        let coalescence = CoalesceBatchesExec::new(Arc::new(merge), 100);
+        let mut stream = coalescence.execute(0, task_ctx).unwrap();
         (vec![stream.next().await.unwrap().unwrap()], survivors)
     }
 

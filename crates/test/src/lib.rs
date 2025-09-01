@@ -4,20 +4,19 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use bytes::Bytes;
+use deltalake_core::kernel::transaction::CommitBuilder;
 use deltalake_core::kernel::{Action, Add, Remove, StructType};
 use deltalake_core::logstore::LogStore;
 use deltalake_core::operations::create::CreateBuilder;
-use deltalake_core::operations::transaction::CommitBuilder;
 use deltalake_core::protocol::{DeltaOperation, SaveMode};
 use deltalake_core::DeltaTable;
 use deltalake_core::DeltaTableBuilder;
 use deltalake_core::{ObjectStore, Path};
 use tempfile::TempDir;
 
+pub mod acceptance;
 pub mod clock;
 pub mod concurrent;
-#[cfg(feature = "datafusion")]
-pub mod datafusion;
 pub mod read;
 pub mod utils;
 
@@ -114,7 +113,7 @@ pub async fn add_file(
     create_time: i64,
     commit_to_log: bool,
 ) {
-    let backend = table.object_store();
+    let backend = table.log_store().object_store(None);
     backend.put(path, data.clone().into()).await.unwrap();
 
     if commit_to_log {
@@ -130,7 +129,6 @@ pub async fn add_file(
             partition_values: part_values,
             data_change: true,
             stats: None,
-            stats_parsed: None,
             tags: None,
             default_row_commit_version: None,
             base_row_id: None,

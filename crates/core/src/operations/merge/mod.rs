@@ -57,6 +57,7 @@ use datafusion_expr::{
     Extension, LogicalPlan, LogicalPlanBuilder, UserDefinedLogicalNode, UNNAMED_TABLE,
 };
 
+use delta_kernel::engine::arrow_conversion::{TryIntoArrow as _, TryIntoKernel as _};
 use delta_kernel::schema::{ColumnMetadataKey, StructType};
 use filter::try_construct_early_filter;
 use futures::future::BoxFuture;
@@ -66,9 +67,7 @@ use tracing::log::*;
 use uuid::Uuid;
 
 use self::barrier::{MergeBarrier, MergeBarrierExec};
-
 use super::datafusion_utils::{into_expr, maybe_into_expr, Expression};
-use super::transaction::{CommitProperties, PROTOCOL};
 use super::{CustomExecuteHandler, Operation};
 use crate::delta_datafusion::expr::{fmt_expr_to_sql, parse_predicate_expression};
 use crate::delta_datafusion::logical::MetricObserver;
@@ -78,16 +77,15 @@ use crate::delta_datafusion::{
     register_store, DataFusionMixins, DeltaColumn, DeltaScan, DeltaScanConfigBuilder,
     DeltaSessionConfig, DeltaTableProvider,
 };
-
+use crate::kernel::transaction::{CommitBuilder, CommitProperties, PROTOCOL};
 use crate::kernel::{Action, Metadata, StructTypeExt};
 use crate::logstore::LogStoreRef;
 use crate::operations::cast::merge_schema::{merge_arrow_field, merge_arrow_schema};
 use crate::operations::cdc::*;
 use crate::operations::merge::barrier::find_node;
-use crate::operations::transaction::CommitBuilder;
 use crate::operations::write::execution::write_execution_plan_v2;
 use crate::operations::write::generated_columns::{
-    add_generated_columns, add_missing_generated_columns,
+    able_to_gc, add_generated_columns, add_missing_generated_columns,
 };
 use crate::operations::write::WriterStatsConfig;
 use crate::protocol::{DeltaOperation, MergePredicate};
@@ -725,7 +723,7 @@ impl ExtensionPlanner for MergeMetricExtensionPlanner {
 #[allow(clippy::too_many_arguments)]
 async fn execute(
     predicate: Expression,
-    source: DataFrame,
+    mut source: DataFrame,
     log_store: LogStoreRef,
     snapshot: DeltaTableState,
     _state: SessionState,
@@ -782,13 +780,18 @@ async fn execute(
         None => TableReference::bare(UNNAMED_TABLE),
     };
 
-    let generated_col_expressions = snapshot
-        .schema()
-        .get_generated_columns()
-        .unwrap_or_default();
+    let mut generated_col_exp = None;
+    let mut missing_generated_col = None;
 
-    let (source, missing_generated_columns) =
-        add_missing_generated_columns(source, &generated_col_expressions)?;
+    if able_to_gc(&snapshot)? {
+        let generated_col_expressions = snapshot.schema().get_generated_columns()?;
+        let (source_with_gc, missing_generated_columns) =
+            add_missing_generated_columns(source, &generated_col_expressions)?;
+
+        source = source_with_gc;
+        generated_col_exp = Some(generated_col_expressions);
+        missing_generated_col = Some(missing_generated_columns);
+    }
     // This is only done to provide the source columns with a correct table reference. Just renaming the columns does not work
     let source = LogicalPlanBuilder::scan(
         source_name.clone(),
@@ -961,7 +964,7 @@ async fn execute(
         )?;
         let schema = Arc::new(schema_builder.finish());
         new_schema = Some(schema.clone());
-        let schema_struct: StructType = schema.try_into()?;
+        let schema_struct: StructType = schema.try_into_kernel()?;
         if &schema_struct != snapshot.schema() {
             let action = Action::Metadata(Metadata::try_new(
                 schema_struct,
@@ -1085,7 +1088,7 @@ async fn execute(
     let mut write_projection_with_cdf = Vec::new();
 
     let schema = if let Some(schema) = new_schema {
-        &schema.try_into()?
+        &schema.try_into_kernel()?
     } else {
         snapshot.schema()
     };
@@ -1109,7 +1112,7 @@ async fn execute(
             None => TableReference::none(),
         };
         let name = delta_field.name();
-        let mut cast_type: DataType = delta_field.data_type().try_into()?;
+        let mut cast_type: DataType = delta_field.data_type().try_into_arrow()?;
 
         // Receive the correct column reference given that some columns are only in source table
         let column = if let Some(field) = snapshot.schema().field(name) {
@@ -1124,7 +1127,7 @@ async fn execute(
         } else {
             null_target_column = Some(cast(
                 lit(ScalarValue::Null).alias(name),
-                delta_field.data_type().try_into()?,
+                delta_field.data_type().try_into_arrow()?,
             ));
             Column::new(source_qualifier.clone(), name)
         };
@@ -1348,12 +1351,16 @@ async fn execute(
             .select(write_projection)?
     };
 
-    projected = add_generated_columns(
-        projected,
-        &generated_col_expressions,
-        &missing_generated_columns,
-        &state,
-    )?;
+    if let Some(generated_col_expressions) = generated_col_exp {
+        if let Some(missing_generated_columns) = missing_generated_col {
+            projected = add_generated_columns(
+                projected,
+                &generated_col_expressions,
+                &missing_generated_columns,
+                &state,
+            )?;
+        }
+    }
 
     let merge_final = &projected.into_unoptimized_plan();
     let write = state.create_physical_plan(merge_final).await?;
@@ -1595,6 +1602,7 @@ mod tests {
     use datafusion_expr::expr::Placeholder;
     use datafusion_expr::lit;
     use datafusion_expr::Expr;
+    use delta_kernel::engine::arrow_conversion::TryIntoKernel;
     use delta_kernel::schema::StructType;
     use itertools::Itertools;
     use regex::Regex;
@@ -1613,7 +1621,7 @@ mod tests {
             .with_partition_columns(partitions.unwrap_or_default())
             .await
             .unwrap();
-        assert_eq!(table.version(), 0);
+        assert_eq!(table.version(), Some(0));
         table
     }
 
@@ -1714,14 +1722,14 @@ mod tests {
         let table = setup_table(None).await;
 
         let table = write_data(table, &schema).await;
-        assert_eq!(table.version(), 1);
+        assert_eq!(table.version(), Some(1));
         assert_eq!(table.get_files_count(), 1);
 
         (table, merge_source(schema))
     }
 
     async fn assert_merge(table: DeltaTable, metrics: MergeMetrics) {
-        assert_eq!(table.version(), 2);
+        assert_eq!(table.version(), Some(2));
         assert!(table.get_files_count() >= 1);
         assert!(metrics.num_target_files_added >= 1);
         assert_eq!(metrics.num_target_files_removed, 1);
@@ -2149,7 +2157,7 @@ mod tests {
             "+----+-------+------------+-------------+",
         ];
         let actual = get_data(&table).await;
-        let expected_schema_struct: StructType = Arc::clone(&schema).try_into().unwrap();
+        let expected_schema_struct: StructType = Arc::clone(&schema).try_into_kernel().unwrap();
         assert_eq!(&expected_schema_struct, table.schema().unwrap());
         assert_batches_sorted_eq!(&expected, &actual);
     }
@@ -2217,7 +2225,7 @@ mod tests {
             "+----+-------+------------+-------------+",
         ];
         let actual = get_data(&table).await;
-        let expected_schema_struct: StructType = Arc::clone(&schema).try_into().unwrap();
+        let expected_schema_struct: StructType = Arc::clone(&schema).try_into_kernel().unwrap();
         assert_eq!(&expected_schema_struct, table.schema().unwrap());
         assert_batches_sorted_eq!(&expected, &actual);
     }
@@ -2395,7 +2403,7 @@ mod tests {
         let table = setup_table(Some(vec!["modified"])).await;
 
         let table = write_data(table, &schema).await;
-        assert_eq!(table.version(), 1);
+        assert_eq!(table.version(), Some(1));
         assert_eq!(table.get_files_count(), 2);
 
         let ctx = SessionContext::new();
@@ -2451,7 +2459,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(table.version(), 2);
+        assert_eq!(table.version(), Some(2));
         assert!(table.get_files_count() >= 3);
         assert!(metrics.num_target_files_added >= 3);
         assert_eq!(metrics.num_target_files_removed, 2);
@@ -2492,7 +2500,7 @@ mod tests {
         let schema = get_arrow_schema(&None);
         let table = setup_table(Some(vec!["modified"])).await;
         let table = write_data(table, &schema).await;
-        assert_eq!(table.version(), 1);
+        assert_eq!(table.version(), Some(1));
         let ctx = SessionContext::new();
         let batch = RecordBatch::try_new(
             Arc::clone(&schema),
@@ -2531,7 +2539,7 @@ mod tests {
             .unwrap()
             .await
             .unwrap();
-        assert_eq!(table.version(), 2);
+        assert_eq!(table.version(), Some(2));
         let commit_info = table.history(None).await.unwrap();
         let last_commit = &commit_info[0];
         let parameters = last_commit.operation_parameters.clone().unwrap();
@@ -2552,7 +2560,7 @@ mod tests {
         let table = setup_table(Some(vec!["id"])).await;
 
         let table = write_data(table, &schema).await;
-        assert_eq!(table.version(), 1);
+        assert_eq!(table.version(), Some(1));
         assert_eq!(table.get_files_count(), 4);
 
         let ctx = SessionContext::new();
@@ -2591,7 +2599,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(table.version(), 2);
+        assert_eq!(table.version(), Some(2));
         assert!(table.get_files_count() >= 3);
         assert_eq!(metrics.num_target_files_added, 3);
         assert_eq!(metrics.num_target_files_removed, 2);
@@ -2631,7 +2639,7 @@ mod tests {
         let table = setup_table(Some(vec!["modified"])).await;
 
         let table = write_data(table, &schema).await;
-        assert_eq!(table.version(), 1);
+        assert_eq!(table.version(), Some(1));
         assert_eq!(table.get_files_count(), 2);
 
         let ctx = SessionContext::new();
@@ -2695,7 +2703,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(table.version(), 2);
+        assert_eq!(table.version(), Some(2));
         assert!(table.get_files_count() >= 3);
         assert!(metrics.num_target_files_added >= 3);
         assert_eq!(metrics.num_target_files_removed, 2);
@@ -2741,7 +2749,7 @@ mod tests {
         let table = setup_table(Some(vec!["modified"])).await;
 
         let table = write_data(table, &schema).await;
-        assert_eq!(table.version(), 1);
+        assert_eq!(table.version(), Some(1));
         assert_eq!(table.get_files_count(), 2);
 
         let ctx = SessionContext::new();
@@ -2769,7 +2777,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(table.version(), 2);
+        assert_eq!(table.version(), Some(2));
         assert!(table.get_files_count() >= 2);
         assert_eq!(metrics.num_target_files_added, 2);
         assert_eq!(metrics.num_target_files_removed, 2);
@@ -2811,7 +2819,7 @@ mod tests {
         let table = setup_table(Some(vec!["modified"])).await;
 
         let table = write_data(table, &schema).await;
-        assert_eq!(table.version(), 1);
+        assert_eq!(table.version(), Some(1));
         assert_eq!(table.get_files_count(), 2);
 
         let ctx = SessionContext::new();
@@ -2839,7 +2847,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(table.version(), 2);
+        assert_eq!(table.version(), Some(2));
         assert!(table.get_files_count() >= 2);
         assert_eq!(metrics.num_target_files_added, 1);
         assert_eq!(metrics.num_target_files_removed, 1);
@@ -2880,7 +2888,7 @@ mod tests {
         let table = setup_table(Some(vec!["modified"])).await;
 
         let table = write_data(table, &schema).await;
-        assert_eq!(table.version(), 1);
+        assert_eq!(table.version(), Some(1));
         assert_eq!(table.get_files_count(), 2);
 
         let ctx = SessionContext::new();
@@ -2908,7 +2916,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(table.version(), 2);
+        assert_eq!(table.version(), Some(2));
         assert_eq!(table.get_files_count(), 2);
         assert_eq!(metrics.num_target_files_added, 2);
         assert_eq!(metrics.num_target_files_removed, 2);
@@ -2944,7 +2952,7 @@ mod tests {
         let table = setup_table(Some(vec!["modified"])).await;
 
         let table = write_data(table, &schema).await;
-        assert_eq!(table.version(), 1);
+        assert_eq!(table.version(), Some(1));
         assert_eq!(table.get_files_count(), 2);
 
         let ctx = SessionContext::new();
@@ -2974,7 +2982,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(table.version(), 2);
+        assert_eq!(table.version(), Some(2));
         assert!(metrics.num_target_files_added == 1);
         assert_eq!(metrics.num_target_files_removed, 1);
         assert_eq!(metrics.num_target_rows_copied, 1);
@@ -3014,7 +3022,7 @@ mod tests {
         let table = setup_table(Some(vec!["modified"])).await;
 
         let table = write_data(table, &schema).await;
-        assert_eq!(table.version(), 1);
+        assert_eq!(table.version(), Some(1));
         assert_eq!(table.get_files_count(), 2);
 
         let ctx = SessionContext::new();
@@ -3043,7 +3051,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(table.version(), 2);
+        assert_eq!(table.version(), Some(2));
         assert_eq!(table.get_files_count(), 2);
         assert_eq!(metrics.num_target_files_added, 2);
         assert_eq!(metrics.num_target_files_removed, 2);
@@ -3079,7 +3087,7 @@ mod tests {
         let table = setup_table(Some(vec!["modified"])).await;
 
         let table = write_data(table, &schema).await;
-        assert_eq!(table.version(), 1);
+        assert_eq!(table.version(), Some(1));
         assert_eq!(table.get_files_count(), 2);
 
         let ctx = SessionContext::new();
@@ -3109,7 +3117,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(table.version(), 2);
+        assert_eq!(table.version(), Some(2));
         assert!(metrics.num_target_files_added == 1);
         assert_eq!(metrics.num_target_files_removed, 1);
         assert_eq!(metrics.num_target_rows_copied, 1);
@@ -3146,7 +3154,7 @@ mod tests {
         let schema = get_arrow_schema(&None);
         let table = setup_table(Some(vec!["modified"])).await;
 
-        assert_eq!(table.version(), 0);
+        assert_eq!(table.version(), Some(0));
         assert_eq!(table.get_files_count(), 0);
 
         let ctx = SessionContext::new();
@@ -3190,7 +3198,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(table.version(), 1);
+        assert_eq!(table.version(), Some(1));
         assert!(table.get_files_count() >= 2);
         assert!(metrics.num_target_files_added >= 2);
         assert_eq!(metrics.num_target_files_removed, 0);
@@ -3233,7 +3241,7 @@ mod tests {
         ]));
         let table = setup_table(Some(vec!["modified"])).await;
 
-        assert_eq!(table.version(), 0);
+        assert_eq!(table.version(), Some(0));
         assert_eq!(table.get_files_count(), 0);
 
         let ctx = SessionContext::new();
@@ -3274,7 +3282,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(table.version(), 1);
+        assert_eq!(table.version(), Some(1));
         assert!(table.get_files_count() >= 2);
         assert!(metrics.num_target_files_added >= 2);
         assert_eq!(metrics.num_target_files_removed, 0);
@@ -3304,7 +3312,7 @@ mod tests {
             "+----+-------+-------------+------------+",
         ];
         let actual = get_data(&table).await;
-        let expected_schema_struct: StructType = Arc::clone(&schema).try_into().unwrap();
+        let expected_schema_struct: StructType = Arc::clone(&schema).try_into_kernel().unwrap();
         assert_eq!(&expected_schema_struct, table.schema().unwrap());
         assert_batches_sorted_eq!(&expected, &actual);
     }
@@ -3318,7 +3326,7 @@ mod tests {
                 true,
             ),
             StructField::new(
-                "vAlue".to_string(),
+                "vAlue".to_string(), // spellchecker:disable-line
                 DataType::Primitive(PrimitiveType::Integer),
                 true,
             ),
@@ -3331,7 +3339,7 @@ mod tests {
 
         let arrow_schema = Arc::new(ArrowSchema::new(vec![
             Field::new("Id", ArrowDataType::Utf8, true),
-            Field::new("vAlue", ArrowDataType::Int32, true),
+            Field::new("vAlue", ArrowDataType::Int32, true), // spellchecker:disable-line
             Field::new("mOdifieD", ArrowDataType::Utf8, true),
         ]));
 
@@ -3358,7 +3366,7 @@ mod tests {
         let source = ctx.read_batch(batch).unwrap();
 
         let table = write_data(table, &arrow_schema).await;
-        assert_eq!(table.version(), 1);
+        assert_eq!(table.version(), Some(1));
         assert_eq!(table.get_files_count(), 1);
 
         let (table, _metrics) = DeltaOps(table)
@@ -3368,7 +3376,7 @@ mod tests {
             .when_not_matched_insert(|insert| {
                 insert
                     .set("Id", "source.Id")
-                    .set("vAlue", "source.vAlue + 1")
+                    .set("vAlue", "source.vAlue + 1") // spellchecker:disable-line
                     .set("mOdifieD", "source.mOdifieD")
             })
             .unwrap()
@@ -3377,7 +3385,7 @@ mod tests {
 
         let expected = vec![
             "+----+-------+------------+",
-            "| Id | vAlue | mOdifieD   |",
+            "| Id | vAlue | mOdifieD   |", // spellchecker:disable-line
             "+----+-------+------------+",
             "| A  | 1     | 2021-02-01 |",
             "| B  | 10    | 2021-02-01 |",
@@ -3654,7 +3662,7 @@ mod tests {
             .with_save_mode(SaveMode::Append)
             .await
             .unwrap();
-        assert_eq!(table.version(), 1);
+        assert_eq!(table.version(), Some(1));
         assert_eq!(table.get_files_count(), 1);
 
         let batch = RecordBatch::try_new(
@@ -3769,7 +3777,7 @@ mod tests {
             .with_save_mode(SaveMode::Append)
             .await
             .unwrap();
-        assert_eq!(table.version(), 1);
+        assert_eq!(table.version(), Some(1));
         assert_eq!(table.get_files_count(), 1);
 
         let batch = RecordBatch::try_new(
@@ -3879,7 +3887,7 @@ mod tests {
             .with_save_mode(SaveMode::Append)
             .await
             .unwrap();
-        assert_eq!(table.version(), 1);
+        assert_eq!(table.version(), Some(1));
         assert_eq!(table.get_files_count(), 1);
 
         let batch = RecordBatch::try_new(
@@ -3958,7 +3966,7 @@ mod tests {
         assert_merge(table.clone(), metrics).await;
 
         // Just checking that the data wasn't actually written instead!
-        if let Ok(files) = crate::storage::utils::flatten_list_stream(
+        if let Ok(files) = crate::logstore::tests::flatten_list_stream(
             &table.object_store(),
             Some(&object_store::path::Path::from("_change_data")),
         )
@@ -3988,12 +3996,12 @@ mod tests {
             .with_configuration_property(TableProperty::EnableChangeDataFeed, Some("true"))
             .await
             .unwrap();
-        assert_eq!(table.version(), 0);
+        assert_eq!(table.version(), Some(0));
 
         let schema = get_arrow_schema(&None);
         let table = write_data(table, &schema).await;
 
-        assert_eq!(table.version(), 1);
+        assert_eq!(table.version(), Some(1));
         assert_eq!(table.get_files_count(), 1);
         let source = merge_source(schema);
 
@@ -4081,7 +4089,7 @@ mod tests {
             .with_configuration_property(TableProperty::EnableChangeDataFeed, Some("true"))
             .await
             .unwrap();
-        assert_eq!(table.version(), 0);
+        assert_eq!(table.version(), Some(0));
 
         let schema = get_arrow_schema(&None);
 
@@ -4093,7 +4101,7 @@ mod tests {
         ]));
         let table = write_data(table, &schema).await;
 
-        assert_eq!(table.version(), 1);
+        assert_eq!(table.version(), Some(1));
         assert_eq!(table.get_files_count(), 1);
         let source = merge_source(schema);
         let source = source.with_column("inserted_by", lit("new_value")).unwrap();
@@ -4138,7 +4146,7 @@ mod tests {
             "+----+-------+------------+-------------+",
         ];
         let actual = get_data(&table).await;
-        let expected_schema_struct: StructType = source_schema.try_into().unwrap();
+        let expected_schema_struct: StructType = source_schema.try_into_kernel().unwrap();
         assert_eq!(&expected_schema_struct, table.schema().unwrap());
         assert_batches_sorted_eq!(&expected, &actual);
 
@@ -4198,12 +4206,12 @@ mod tests {
             .with_configuration_property(TableProperty::EnableChangeDataFeed, Some("true"))
             .await
             .unwrap();
-        assert_eq!(table.version(), 0);
+        assert_eq!(table.version(), Some(0));
 
         let schema = get_arrow_schema(&None);
         let table = write_data(table, &schema).await;
 
-        assert_eq!(table.version(), 1);
+        assert_eq!(table.version(), Some(1));
         assert_eq!(table.get_files_count(), 1);
         let source = merge_source(schema);
 

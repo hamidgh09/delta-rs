@@ -9,9 +9,9 @@ use object_store::ObjectMeta;
 use super::{get_parquet_bytes, DataFactory, FileStats};
 use crate::kernel::arrow::extract::{self as ex};
 use crate::kernel::partitions_schema;
+use crate::kernel::transaction::PROTOCOL;
 use crate::kernel::{Add, Metadata, Protocol, Remove, StructType};
-use crate::operations::transaction::PROTOCOL;
-use delta_kernel::table_features::{ReaderFeatures, WriterFeatures};
+use delta_kernel::table_features::{ReaderFeature, WriterFeature};
 
 pub struct ActionFactory;
 
@@ -34,7 +34,6 @@ impl ActionFactory {
             deletion_vector: None,
             base_row_id: None,
             clustering_provider: None,
-            stats_parsed: None,
         }
     }
 
@@ -86,7 +85,7 @@ impl ActionFactory {
         let data = get_parquet_bytes(&batch).unwrap();
         let meta = ObjectMeta {
             location: path.clone(),
-            size: data.len(),
+            size: data.len() as u64,
             last_modified: Utc::now(),
             e_tag: None,
             version: None,
@@ -101,8 +100,8 @@ impl ActionFactory {
     pub fn protocol(
         max_reader: Option<i32>,
         max_writer: Option<i32>,
-        reader_features: Option<impl IntoIterator<Item = ReaderFeatures>>,
-        writer_features: Option<impl IntoIterator<Item = WriterFeatures>>,
+        reader_features: Option<impl IntoIterator<Item = ReaderFeature>>,
+        writer_features: Option<impl IntoIterator<Item = WriterFeature>>,
     ) -> Protocol {
         Protocol {
             min_reader_version: max_reader.unwrap_or(PROTOCOL.default_reader_version()),

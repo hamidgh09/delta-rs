@@ -3,8 +3,8 @@ use arrow_array::{Int32Array, RecordBatch};
 use arrow_schema::{DataType as ArrowDataType, Field};
 use chrono::DateTime;
 use deltalake_core::kernel::{DataType, PrimitiveType, StructField};
+use deltalake_core::logstore::commit_uri_from_version;
 use deltalake_core::protocol::SaveMode;
-use deltalake_core::storage::commit_uri_from_version;
 use deltalake_core::{DeltaOps, DeltaTable};
 use itertools::Itertools;
 use rand::Rng;
@@ -179,7 +179,7 @@ async fn test_restore_file_missing() -> Result<(), Box<dyn Error>> {
     for file in context
         .table
         .snapshot()?
-        .all_tombstones(context.table.object_store().clone())
+        .all_tombstones(&context.table.log_store())
         .await?
     {
         let p = tmp_dir.path().join(file.clone().path);
@@ -208,7 +208,7 @@ async fn test_restore_allow_file_missing() -> Result<(), Box<dyn Error>> {
     for file in context
         .table
         .snapshot()?
-        .all_tombstones(context.table.object_store().clone())
+        .all_tombstones(&context.table.log_store())
         .await?
     {
         let p = tmp_dir.path().join(file.clone().path);

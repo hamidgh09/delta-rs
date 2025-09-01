@@ -7,6 +7,7 @@ use datafusion::execution::context::{SessionState, TaskContext};
 use datafusion::prelude::DataFrame;
 use datafusion_expr::{lit, when, Expr, LogicalPlanBuilder};
 use datafusion_physical_plan::ExecutionPlan;
+use delta_kernel::engine::arrow_conversion::TryIntoKernel as _;
 use futures::StreamExt;
 use object_store::prefix::PrefixStore;
 use parquet::file::properties::WriterProperties;
@@ -19,9 +20,8 @@ use crate::delta_datafusion::{find_files, DeltaScanConfigBuilder, DeltaTableProv
 use crate::delta_datafusion::{DataFusionMixins, DeltaDataChecker};
 use crate::errors::DeltaResult;
 use crate::kernel::{Action, Add, AddCDCFile, Remove, StructType, StructTypeExt};
-use crate::logstore::LogStoreRef;
+use crate::logstore::{LogStoreRef, ObjectStoreRef};
 use crate::operations::cdc::should_write_cdc;
-use crate::storage::ObjectStoreRef;
 use crate::table::state::DeltaTableState;
 use crate::table::Constraint as DeltaConstraint;
 use crate::DeltaTableError;
@@ -258,7 +258,7 @@ pub(crate) async fn write_execution_plan_v2(
         DeltaDataChecker::new(snapshot)
     } else {
         debug!("Using plan schema to derive generated columns, since no snapshot was provided. Implies first write.");
-        let delta_schema: StructType = schema.as_ref().try_into()?;
+        let delta_schema: StructType = schema.as_ref().try_into_kernel()?;
         DeltaDataChecker::new_with_generated_columns(
             delta_schema.get_generated_columns().unwrap_or_default(),
         )
