@@ -4,7 +4,7 @@ set -e
 # Write the Dockerfile into the current directory.
 cat << 'EOF' > Dockerfile
 # Use a slim Debian base image
-FROM python:3.11.9-slim
+FROM quay.io/pypa/manylinux_2_28_x86_64 AS build
 
 # Build arguments to allow setting user/group from host values.
 ARG USER_ID=1000
@@ -12,52 +12,40 @@ ARG GROUP_ID=1000
 ARG USER_NAME=user
 ARG GROUP_NAME=user
 
-# Set environment variables
-ENV DEBIAN_FRONTEND=noninteractive
-ENV HOME=/home/${USER_NAME}
+# Always start as root for package install
+USER root
 
-# Install system dependencies required for building Python and for other tools.
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    build-essential \
-    wget \
-    curl \
-    ca-certificates \
-    libssl-dev \
-    libffi-dev \
-    zlib1g-dev \
-    libbz2-dev \
-    libreadline-dev \
-    libsqlite3-dev \
-    libncursesw5-dev \
-    libgdbm-dev \
-    libnss3-dev \
-    liblzma-dev \
-    tk-dev \
-    python3 \
-    python3-pip \
-    git \
-    patchelf \
-    curl \
- && rm -rf /var/lib/apt/lists/*
+# Install build deps via yum/dnf (no apt-get here).
+# Note: manylinux images already include lots of toolchain bits.
+RUN yum -y update && \
+    yum -y install \
+      gcc gcc-c++ make \
+      git wget curl ca-certificates \
+      openssl-devel libffi-devel zlib-devel bzip2 bzip2-devel \
+      readline-devel sqlite-devel ncurses-devel gdbm-devel nss-devel \
+      xz xz-devel tk tk-devel which findutils && \
+    yum clean all && rm -rf /var/cache/yum
 
-
-# Install the "uv" Python package via pip
-RUN python3 -m pip install --upgrade pip && \
-    python3 -m pip install uv
-
-RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
-
-# Create a group and user with the specified IDs, and set up the home directory.
+# Create non-root user
 RUN groupadd -g ${GROUP_ID} ${GROUP_NAME} && \
     useradd -m -u ${USER_ID} -g ${GROUP_NAME} -s /bin/bash ${USER_NAME}
 
-RUN chown -R ${USER_NAME}:${GROUP_NAME} ${HOME}
+# Use the bundled Python 3.11 from manylinux (adjust if you need a different ABI)
+ENV PYBIN=/opt/python/cp311-cp311/bin
 
-# Switch to the new user.
+# Install uv with the manylinux Python
+RUN ${PYBIN}/pip install --upgrade pip && \
+    ${PYBIN}/pip install uv
+
+# Install Rust for the non-root user (keeps cargo in their home)
 USER ${USER_NAME}
+ENV HOME=/home/${USER_NAME}
 WORKDIR ${HOME}
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | bash -s -- -y
+ENV PATH="${HOME}/.cargo/bin:${PATH}"
 
-ENV PATH=${HOME}/.cargo/bin:$PATH
+# (Optional) expose the manylinux Python first on PATH for convenience
+ENV PATH="${PYBIN}:${PATH}"
 
 EOF
 
@@ -76,4 +64,4 @@ echo "Docker image built successfully."
 docker run --rm=true \
    -v "$(pwd):/home/$(id -un)"/delta-rs \
    delta-rs-build \
-   /bin/bash -c "cd /home/$(id -un)/delta-rs/python && make clean && export MATURIN_EXTRA_ARGS=--release && make build"
+   /bin/bash -c "cd /home/$(id -un)/delta-rs/python && make clean && export MATURIN_EXTRA_ARGS='--release --compatibility manylinux_2_28' && make build"
