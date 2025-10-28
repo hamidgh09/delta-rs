@@ -1,0 +1,59 @@
+name: Build python hops_deltalake
+
+on:
+  workflow_dispatch:
+
+defaults:
+  run:
+    working-directory: ./python
+
+jobs:
+  build-mac:
+    name: python whl file build on Mac
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [aarch64-apple-darwin]
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build wheel file (without publishing)
+        uses: messense/maturin-action@v1
+        with:
+          target: ${{ matrix.target }}
+          command: build
+          args: --release -m python/Cargo.toml
+
+      - name: Save wheel artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: wheels-${{ matrix.target }}
+          path: target/wheels/*.whl
+
+  build-manylinux-x86-64:
+    name: python whl file build on manylinux x86-64
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [ x86_64-unknown-linux-gnu ]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build wheel file (without publishing)
+        uses: messense/maturin-action@v1
+        with:
+          maturin-version: v1.6.0 # https://github.com/PyO3/maturin/issues/2154
+          target: ${{ matrix.target }}
+          command: build
+          manylinux: 2_28
+          args: --release -m python/Cargo.toml
+          # for openssl build
+          before-script-linux: yum install -y perl-IPC-Cmd openssl-devel pkgconfig
+
+      - name: Save wheel artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: wheels-${{ matrix.target }}
+          path: target/wheels/*.whl

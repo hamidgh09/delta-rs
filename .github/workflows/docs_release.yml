@@ -1,13 +1,7 @@
 name: Release documentation
 
 on:
-  pull_request:
-    types:
-      - closed
-    branches: [main]
-    paths:
-      - docs/**
-      - mkdocs.yml
+  workflow_dispatch:
 
 jobs:
   release-docs:

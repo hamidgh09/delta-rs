@@ -1,11 +1,7 @@
 name: build
 
 on:
-  push:
-    branches: [main, "rust-v*"]
-  pull_request:
-    branches: [main, "rust-v*"]
-  merge_group:
+  workflow_dispatch:
 
 env:
   DEFAULT_FEATURES: "azure,datafusion,s3,gcs,glue,hdfs "
