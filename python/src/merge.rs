@@ -2,11 +2,11 @@ use deltalake::arrow::datatypes::Schema as ArrowSchema;
 use deltalake::datafusion::catalog::TableProvider;
 use deltalake::datafusion::datasource::MemTable;
 use deltalake::datafusion::physical_plan::memory::LazyBatchGenerator;
-use deltalake::datafusion::prelude::SessionContext;
+use deltalake::delta_datafusion::create_session;
+use deltalake::kernel::EagerSnapshot;
 use deltalake::logstore::LogStoreRef;
-use deltalake::operations::merge::MergeBuilder;
 use deltalake::operations::CustomExecuteHandler;
-use deltalake::table::state::DeltaTableState;
+use deltalake::operations::merge::MergeBuilder;
 use deltalake::{DeltaResult, DeltaTable, DeltaTableError};
 use parking_lot::RwLock;
 use pyo3::prelude::*;
@@ -18,10 +18,10 @@ use std::sync::Arc;
 use crate::datafusion::LazyTableProvider;
 use crate::error::PythonError;
 use crate::utils::rt;
-use crate::writer::{maybe_lazy_cast_reader, ArrowStreamBatchGenerator};
+use crate::writer::{ArrowStreamBatchGenerator, maybe_lazy_cast_reader};
 use crate::{
-    maybe_create_commit_properties, set_writer_properties, PyCommitProperties,
-    PyPostCommitHookProperties, PyWriterProperties,
+    PyCommitProperties, PyPostCommitHookProperties, PyWriterProperties,
+    maybe_create_commit_properties, set_writer_properties,
 };
 
 #[pyclass(module = "deltalake._internal")]
@@ -40,7 +40,7 @@ impl PyMergeBuilder {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         log_store: LogStoreRef,
-        snapshot: DeltaTableState,
+        snapshot: EagerSnapshot,
         source: PyRecordBatchReader,
         batch_schema: PyArrowSchema,
         predicate: String,
@@ -54,7 +54,7 @@ impl PyMergeBuilder {
         commit_properties: Option<PyCommitProperties>,
         custom_execute_handler: Option<Arc<dyn CustomExecuteHandler>>,
     ) -> DeltaResult<Self> {
-        let ctx = SessionContext::new();
+        let ctx = create_session().into_inner();
 
         let source = source
             .into_reader()
@@ -79,7 +79,7 @@ impl PyMergeBuilder {
             ctx.read_table(table_provider).unwrap()
         };
 
-        let mut cmd = MergeBuilder::new(log_store, snapshot, predicate, source_df)
+        let mut cmd = MergeBuilder::new(log_store, Some(snapshot), predicate, source_df)
             .with_safe_cast(safe_cast)
             .with_streaming(streamed_exec);
 

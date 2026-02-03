@@ -1,6 +1,6 @@
 [package]
 name = "deltalake-azure"
-version = "0.11.0"
+version = "0.13.0"
 authors.workspace = true
 keywords.workspace = true
 readme.workspace = true
@@ -12,21 +12,17 @@ repository.workspace = true
 rust-version.workspace = true
 
 [dependencies]
-deltalake-core = { version = "0.28.0", path = "../core", features = ["cloud"] }
+deltalake-core = { version = "0.30.0", path = "../core", features = ["cloud"] }
 
 # workspace depenndecies
-async-trait = { workspace = true }
 bytes = { workspace = true }
-futures = { workspace = true }
-tracing = { workspace = true }
 object_store = { workspace = true, features = ["azure"] }
 thiserror = { workspace = true }
 tokio = { workspace = true }
-regex = { workspace = true }
 url = { workspace = true }
 
 [dev-dependencies]
-deltalake-core = { version = "0.28.0", path = "../core", features = [
+deltalake-core = { version = "0.30.0", path = "../core", features = [
     "datafusion",
 ] }
 chrono = { workspace = true }
@@ -35,6 +31,9 @@ deltalake-test = { path = "../test" }
 pretty_env_logger = "0.5.0"
 rand = "0.8"
 serde_json = { workspace = true }
+azure_storage_blobs = { version = "0.21.0" }
+futures.workspace = true
+azure_storage = "0.21.0"
 
 [features]
 integration_test = []

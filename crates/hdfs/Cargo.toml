@@ -12,11 +12,10 @@ repository.workspace = true
 rust-version.workspace = true
 
 [dependencies]
-deltalake-core = { version = "0.28.0", path = "../core"}
+deltalake-core = { version = "0.30.0", path = "../core"}
 hdfs-native-object-store = { git = "https://github.com/logicalclocks/hopsfs-native-object-store.git" , branch = "dev"}
 
-# workspace dependecies
-object_store = { workspace = true }
+# workspace dependencies
 tokio = { workspace = true }
 url = { workspace = true }
 

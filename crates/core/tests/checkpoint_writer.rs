@@ -1,5 +1,4 @@
 mod fs_common;
-use deltalake_core::protocol::DeltaOperation;
 
 // NOTE: The below is a useful external command for inspecting the written checkpoint schema visually:
 // parquet-tools inspect tests/data/checkpoints/_delta_log/00000000000000000005.checkpoint.parquet
@@ -25,7 +24,8 @@ mod simple_checkpoint {
         cleanup_checkpoint_files(log_path.as_path());
 
         // Load the delta table at version 5
-        let mut table = deltalake_core::open_table_with_version(table_location, 5)
+        let table_url = deltalake_core::table::builder::parse_table_uri(table_location).unwrap();
+        let mut table = deltalake_core::open_table_with_version(table_url.clone(), 5)
             .await
             .unwrap();
 
@@ -58,56 +58,10 @@ mod simple_checkpoint {
         assert_eq!(10, version);
 
         // delta table should load just fine with the checkpoint in place
-        let table_result = deltalake_core::open_table(table_location).await.unwrap();
+        let table_result = deltalake_core::open_table(table_url.clone()).await.unwrap();
         let table = table_result;
-        let files = table.get_files_iter().unwrap();
-        assert_eq!(12, files.count());
-    }
-
-    #[ignore]
-    #[tokio::test]
-    #[serial]
-    async fn checkpoint_run_length_encoding_test() {
-        let table_location = "../test/tests/data/checkpoints";
-        let table_path = PathBuf::from(table_location);
-        let log_path = table_path.join("_delta_log");
-
-        // Delete checkpoint files from previous runs
-        cleanup_checkpoint_files(log_path.as_path());
-
-        // Load the delta table
-        let base_table = deltalake_core::open_table(table_location).await.unwrap();
-
-        // Set the table properties to disable run length encoding
-        // this alters table version and should be done in a more principled way
-        let table = DeltaOps(base_table)
-            .set_tbl_properties()
-            .with_properties(std::collections::HashMap::<String, String>::from([(
-                "delta-rs.checkpoint.useRunLengthEncoding".to_string(),
-                "false".to_string(),
-            )]))
-            .await
-            .unwrap();
-
-        // Write a checkpoint
-        checkpoints::create_checkpoint(&table, None).await.unwrap();
-
-        // checkpoint should exist
-        let checkpoint_path = log_path.join("00000000000000000013.checkpoint.parquet");
-        assert!(checkpoint_path.as_path().exists());
-
-        // Check that the checkpoint does not use run length encoding
-        assert_column_rle_encoding(checkpoint_path, false);
-
-        // _last_checkpoint should exist and point to the correct version
-        let version = get_last_checkpoint_version(&log_path);
-        assert_eq!(table.version(), Some(version));
-
-        // delta table should load just fine with the checkpoint in place
-        let table_result = deltalake_core::open_table(table_location).await.unwrap();
-        let table = table_result;
-        let files = table.get_files_iter().unwrap();
-        assert_eq!(12, files.count());
+        let files = table.snapshot().unwrap().log_data().num_files();
+        assert_eq!(12, files);
     }
 
     fn assert_column_rle_encoding(file_path: PathBuf, should_be_rle: bool) {
@@ -123,7 +77,7 @@ mod simple_checkpoint {
                     row_group.column(j);
 
                 for encoding in column_chunk.encodings() {
-                    if *encoding == Encoding::RLE_DICTIONARY {
+                    if encoding == Encoding::RLE_DICTIONARY {
                         found_rle = true;
                     }
                 }
@@ -161,12 +115,11 @@ mod simple_checkpoint {
                 None => continue,
             };
 
-            if let Some(caps) = re.captures(filename) {
-                if let Ok(num) = caps[1].parse::<u64>() {
-                    if num <= 12 {
-                        continue;
-                    }
-                }
+            if let Some(caps) = re.captures(filename)
+                && let Ok(num) = caps[1].parse::<u64>()
+                && num <= 12
+            {
+                continue;
             }
             let _ = fs::remove_file(path);
         }
@@ -175,6 +128,7 @@ mod simple_checkpoint {
 
 mod delete_expired_delta_log_in_checkpoint {
     use super::*;
+    use std::collections::HashMap;
     use std::fs::{FileTimes, OpenOptions};
     use std::ops::Sub;
     use std::time::{Duration, SystemTime};
@@ -182,22 +136,32 @@ mod delete_expired_delta_log_in_checkpoint {
     use ::object_store::path::Path as ObjectStorePath;
     use deltalake_core::table::config::TableProperty;
     use deltalake_core::*;
-    use maplit::hashmap;
 
     #[tokio::test]
-    async fn test_delete_expired_logs() {
+    async fn test_delete_expired_logs() -> DeltaResult<()> {
         let mut table = fs_common::create_table(
             "../test/tests/data/checkpoints_with_expired_logs/expired",
-            Some(hashmap! {
-                TableProperty::LogRetentionDuration.as_ref().into() => Some("interval 10 minute".to_string()),
-                TableProperty::EnableExpiredLogCleanup.as_ref().into() => Some("true".to_string())
-            }),
+            Some(HashMap::from([
+                (
+                    TableProperty::LogRetentionDuration.as_ref().into(),
+                    Some("interval 0 minute".to_string()),
+                ),
+                (
+                    TableProperty::EnableExpiredLogCleanup.as_ref().into(),
+                    Some("true".to_string()),
+                ),
+            ])),
         )
         .await;
 
-        let table_path = table.table_uri();
+        let table_path = table
+            .table_url()
+            .to_file_path()
+            .expect("Failed toc convert the table's Url to a file path");
         let set_file_last_modified = |version: usize, last_modified_millis: u64| {
-            let path = format!("{table_path}_delta_log/{version:020}.json");
+            let mut path = table_path.clone();
+            path.push("_delta_log");
+            path.push(format!("{version:020}.json"));
             let file = OpenOptions::new().write(true).open(path).unwrap();
             let last_modified = SystemTime::now().sub(Duration::from_millis(last_modified_millis));
             let times = FileTimes::new()
@@ -214,25 +178,31 @@ mod delete_expired_delta_log_in_checkpoint {
 
         // set last_modified
         set_file_last_modified(0, 25 * 60 * 1000); // 25 mins ago, should be deleted
-        set_file_last_modified(1, 15 * 60 * 1000); // 25 mins ago, should be deleted
-        set_file_last_modified(2, 5 * 60 * 1000); // 25 mins ago, should be kept
+        set_file_last_modified(1, 15 * 60 * 1000); // 15 mins ago, should be deleted
+        set_file_last_modified(2, 5 * 60 * 1000); // 5 mins ago, should be kept as last safe checkpoint
 
         table.load_version(0).await.expect("Cannot load version 0");
         table.load_version(1).await.expect("Cannot load version 1");
         table.load_version(2).await.expect("Cannot load version 2");
 
-        checkpoints::create_checkpoint_from_table_uri_and_cleanup(
-            &table.table_uri(),
-            table.version().unwrap(),
+        checkpoints::create_checkpoint_from_table_url_and_cleanup(
+            table.table_url().clone(),
+            table.version().expect("Failed to load version() on table"),
             None,
             None,
         )
         .await
-        .unwrap();
+        .expect("Failed to create a checkpoint and cleanup");
 
-        table.update().await.unwrap(); // make table to read the checkpoint
+        table
+            .load()
+            .await
+            .expect("Failed to read the checkpoint back");
         assert_eq!(
-            table.get_files_iter().unwrap().collect::<Vec<_>>(),
+            table
+                .get_files_by_partitions(&[])
+                .await
+                .expect("Failed to get_files_by_partitions()"),
             vec![
                 ObjectStorePath::from(a2.path.as_ref()),
                 ObjectStorePath::from(a1.path.as_ref()),
@@ -250,16 +220,123 @@ mod delete_expired_delta_log_in_checkpoint {
             .expect_err("Should not load version 1");
         // log file 2 is kept
         table.load_version(2).await.expect("Cannot load version 2");
+        Ok(())
+    }
+
+    // Test to verify that intermediate versions can still be loaded after the checkpoint is created.
+    // This is to verify the behavior of `cleanup_expired_logs_for` and its use of safe checkpoints.
+    #[tokio::test]
+    async fn test_delete_expired_logs_safe_checkpoint() -> DeltaResult<()> {
+        // For additional tracing:
+        // let _ = pretty_env_logger::try_init();
+        let mut table = fs_common::create_table(
+            "../test/tests/data/checkpoints_with_expired_logs/expired_with_checkpoint",
+            Some(HashMap::from([
+                (
+                    TableProperty::LogRetentionDuration.as_ref().into(),
+                    Some("interval 10 minute".to_string()),
+                ),
+                (
+                    TableProperty::EnableExpiredLogCleanup.as_ref().into(),
+                    Some("true".to_string()),
+                ),
+            ])),
+        )
+        .await;
+
+        let table_path = table
+            .table_url()
+            .to_file_path()
+            .expect("Failed toc convert the table's Url to a file path");
+        let set_file_last_modified = |version: usize, last_modified_millis: u64, suffix: &str| {
+            let mut path = table_path.clone();
+            path.push("_delta_log");
+            path.push(format!("{version:020}.{suffix}"));
+            let file = OpenOptions::new().write(true).open(path).unwrap();
+            let last_modified = SystemTime::now().sub(Duration::from_millis(last_modified_millis));
+            let times = FileTimes::new()
+                .set_modified(last_modified)
+                .set_accessed(last_modified);
+            file.set_times(times).unwrap();
+        };
+
+        // create 4 commits
+        let a1 = fs_common::add(0);
+        let a2 = fs_common::add(0);
+        let a3 = fs_common::add(0);
+        let a4 = fs_common::add(0);
+        assert_eq!(1, fs_common::commit_add(&mut table, &a1).await);
+        assert_eq!(2, fs_common::commit_add(&mut table, &a2).await);
+        assert_eq!(3, fs_common::commit_add(&mut table, &a3).await);
+        assert_eq!(4, fs_common::commit_add(&mut table, &a4).await);
+
+        // set last_modified
+        set_file_last_modified(0, 25 * 60 * 1000, "json"); // 25 mins ago, should be deleted
+        set_file_last_modified(1, 20 * 60 * 1000, "json"); // 20 mins ago, last safe checkpoint, should be kept
+        set_file_last_modified(2, 15 * 60 * 1000, "json"); // 15 mins ago, fails retention cutoff, but needed by v3
+        set_file_last_modified(3, 6 * 60 * 1000, "json"); // 6 mins ago, should be kept by retention cutoff
+        set_file_last_modified(4, 5 * 60 * 1000, "json"); // 5 mins ago, should be kept by retention cutoff
+
+        table.load_version(0).await.expect("Cannot load version 0");
+        table.load_version(1).await.expect("Cannot load version 1");
+        table.load_version(2).await.expect("Cannot load version 2");
+        table.load_version(3).await.expect("Cannot load version 3");
+        table.load_version(4).await.expect("Cannot load version 4");
+
+        // Create checkpoint for version 1
+        checkpoints::create_checkpoint_from_table_url_and_cleanup(
+            deltalake_core::ensure_table_uri(table.table_url()).unwrap(),
+            1,
+            Some(false),
+            None,
+        )
+        .await
+        .unwrap();
+
+        // Update checkpoint time for version 1 to be just after version 1 data
+        set_file_last_modified(1, 20 * 60 * 1000 - 10, "checkpoint.parquet");
+
+        // Checkpoint final version
+        checkpoints::create_checkpoint_from_table_url_and_cleanup(
+            deltalake_core::ensure_table_uri(table.table_url()).unwrap(),
+            table.version().unwrap(),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        table.update_state().await.unwrap(); // make table to read the checkpoint
+        assert_eq!(
+            table.get_files_by_partitions(&[]).await?,
+            vec![
+                ObjectStorePath::from(a4.path.as_ref()),
+                ObjectStorePath::from(a3.path.as_ref()),
+                ObjectStorePath::from(a2.path.as_ref()),
+                ObjectStorePath::from(a1.path.as_ref()),
+            ]
+        );
+
+        // Without going back to a safe checkpoint, previously loading version 3 would fail.
+        table.load_version(3).await.expect("Cannot load version 3");
+        table.load_version(4).await.expect("Cannot load version 4");
+        Ok(())
     }
 
     #[tokio::test]
-    async fn test_not_delete_expired_logs() {
+    async fn test_not_delete_expired_logs() -> DeltaResult<()> {
         let mut table = fs_common::create_table(
             "../test/tests/data/checkpoints_with_expired_logs/not_delete_expired",
-            Some(hashmap! {
-                TableProperty::LogRetentionDuration.as_ref().into() => Some("interval 1 second".to_string()),
-                TableProperty::EnableExpiredLogCleanup.as_ref().into() => Some("false".to_string())
-            }),
+            Some(HashMap::from([
+                (
+                    TableProperty::LogRetentionDuration.as_ref().into(),
+                    Some("interval 1 second".to_string()),
+                ),
+                (
+                    TableProperty::EnableExpiredLogCleanup.as_ref().into(),
+                    Some("false".to_string()),
+                ),
+            ])),
         )
         .await;
 
@@ -271,17 +348,17 @@ mod delete_expired_delta_log_in_checkpoint {
         table.load_version(0).await.expect("Cannot load version 0");
         table.load_version(1).await.expect("Cannot load version 1");
 
-        checkpoints::create_checkpoint_from_table_uri_and_cleanup(
-            &table.table_uri(),
+        checkpoints::create_checkpoint_from_table_url_and_cleanup(
+            deltalake_core::ensure_table_uri(table.table_url()).unwrap(),
             table.version().unwrap(),
             None,
             None,
         )
         .await
         .unwrap();
-        table.update().await.unwrap(); // make table to read the checkpoint
+        table.update_state().await.unwrap(); // make table to read the checkpoint
         assert_eq!(
-            table.get_files_iter().unwrap().collect::<Vec<_>>(),
+            table.get_files_by_partitions(&[]).await?,
             vec![
                 ObjectStorePath::from(a2.path.as_ref()),
                 ObjectStorePath::from(a1.path.as_ref()),
@@ -298,112 +375,6 @@ mod delete_expired_delta_log_in_checkpoint {
             .expect("Should not delete version 1");
 
         table.load_version(2).await.expect("Cannot load version 2");
-    }
-}
-
-mod checkpoints_with_tombstones {
-    use super::*;
-
-    use ::object_store::path::Path as ObjectStorePath;
-    use chrono::Utc;
-    use deltalake_core::kernel::*;
-    use deltalake_core::table::config::TableProperty;
-    use deltalake_core::*;
-    use maplit::hashmap;
-    use pretty_assertions::assert_eq;
-    use std::collections::{HashMap, HashSet};
-
-    #[tokio::test]
-    #[ignore]
-    async fn test_expired_tombstones() {
-        let mut table = fs_common::create_table("../test/tests/data/checkpoints_tombstones/expired", Some(hashmap! {
-            TableProperty::DeletedFileRetentionDuration.as_ref().into() => Some("interval 1 minute".to_string())
-        })).await;
-
-        let a1 = fs_common::add(3 * 60 * 1000); // 3 mins ago,
-        let a2 = fs_common::add(2 * 60 * 1000); // 2 mins ago,
-
-        assert_eq!(1, fs_common::commit_add(&mut table, &a1).await);
-        assert_eq!(2, fs_common::commit_add(&mut table, &a2).await);
-        checkpoints::create_checkpoint(&table, None).await.unwrap();
-        table.update().await.unwrap(); // make table to read the checkpoint
-        assert_eq!(
-            table.get_files_iter().unwrap().collect::<Vec<_>>(),
-            vec![
-                ObjectStorePath::from(a2.path.as_ref()),
-                ObjectStorePath::from(a1.path.as_ref()),
-            ]
-        );
-
-        let (removes1, opt1) = pseudo_optimize(&mut table, 5 * 59 * 1000).await;
-        assert_eq!(
-            table.get_files_iter().unwrap().collect::<Vec<_>>(),
-            vec![ObjectStorePath::from(opt1.path.as_ref())]
-        );
-
-        assert_eq!(
-            table
-                .snapshot()
-                .unwrap()
-                .all_tombstones(&table.log_store())
-                .await
-                .unwrap()
-                .collect::<HashSet<_>>(),
-            removes1
-        );
-
-        checkpoints::create_checkpoint(&table, None).await.unwrap();
-        table.update().await.unwrap(); // make table to read the checkpoint
-        assert_eq!(
-            table.get_files_iter().unwrap().collect::<Vec<_>>(),
-            vec![ObjectStorePath::from(opt1.path.as_ref())]
-        );
-        assert_eq!(
-            table
-                .snapshot()
-                .unwrap()
-                .all_tombstones(&table.log_store())
-                .await
-                .unwrap()
-                .count(),
-            0
-        ); // stale removes are deleted from the state
-    }
-
-    async fn pseudo_optimize(table: &mut DeltaTable, offset_millis: i64) -> (HashSet<Remove>, Add) {
-        let removes: HashSet<Remove> = table
-            .get_files_iter()
-            .unwrap()
-            .map(|p| Remove {
-                path: p.to_string(),
-                deletion_timestamp: Some(Utc::now().timestamp_millis() - offset_millis),
-                data_change: false,
-                extended_file_metadata: None,
-                partition_values: Some(HashMap::new()),
-                size: None,
-                tags: Some(HashMap::new()),
-                deletion_vector: None,
-                base_row_id: None,
-                default_row_commit_version: None,
-            })
-            .collect();
-
-        let add = Add {
-            data_change: false,
-            ..fs_common::add(offset_millis)
-        };
-
-        let actions = removes
-            .iter()
-            .cloned()
-            .map(Action::Remove)
-            .chain(std::iter::once(Action::Add(add.clone())))
-            .collect();
-        let operation = DeltaOperation::Optimize {
-            predicate: None,
-            target_size: 1000000,
-        };
-        fs_common::commit_actions(table, actions, operation).await;
-        (removes, add)
+        Ok(())
     }
 }

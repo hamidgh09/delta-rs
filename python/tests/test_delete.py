@@ -29,7 +29,7 @@ def test_delete_no_predicates(existing_sample_table: DeltaTable):
     data = qb.execute("select * from tbl").read_all()
 
     assert data.num_rows == 0
-    assert len(existing_sample_table.files()) == 0
+    assert len(existing_sample_table.file_uris()) == 0
 
 
 @pytest.mark.pyarrow
@@ -51,7 +51,7 @@ def test_delete_a_partition(tmp_path: pathlib.Path, sample_data_pyarrow: "pa.Tab
 
     table = dt.to_pyarrow_table()
     assert table.equals(expected_table)
-    assert len(dt.files()) == 1
+    assert len(dt.file_uris()) == 1
 
 
 @pytest.mark.pyarrow
@@ -106,12 +106,12 @@ def test_delete_stats_columns_stats_provided(tmp_path: pathlib.Path):
     assert get_value("null_count.foo") == 2
     assert get_value("min.foo") == "a"
     assert get_value("max.foo") == "b"
-    assert get_value("null_count.bar") is None
-    assert get_value("min.bar") is None
-    assert get_value("max.bar") is None
     assert get_value("null_count.baz") == 2
     assert get_value("min.baz") == 1
     assert get_value("max.baz") == 1
+
+    with pytest.raises(Exception):
+        get_value("null_count.bar")
 
     dt.delete("bar == 3")
 
@@ -127,9 +127,9 @@ def test_delete_stats_columns_stats_provided(tmp_path: pathlib.Path):
     assert get_value("null_count.foo") == 1
     assert get_value("min.foo") == "a"
     assert get_value("max.foo") == "b"
-    assert get_value("null_count.bar") is None
-    assert get_value("min.bar") is None
-    assert get_value("max.bar") is None
     assert get_value("null_count.baz") == 1
     assert get_value("min.baz") == 1
     assert get_value("max.baz") == 1
+
+    with pytest.raises(Exception):
+        get_value("null_count.bar")
