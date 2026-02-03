@@ -10,14 +10,15 @@
 //! they can be removed from the delta log.
 
 use std::{
-    collections::{HashMap, HashSet},
+    collections::HashMap,
     pin::Pin,
-    sync::{Arc, Mutex},
+    sync::Arc,
     task::{Context, Poll},
 };
 
-use arrow_array::{builder::UInt64Builder, ArrayRef, RecordBatch};
-use arrow_schema::SchemaRef;
+use arrow::array::{Array, ArrayRef, RecordBatch, builder::UInt64Builder};
+use arrow::datatypes::SchemaRef;
+use dashmap::DashSet;
 use datafusion::common::{DataFusionError, Result as DataFusionResult};
 use datafusion::logical_expr::{Expr, LogicalPlan, UserDefinedLogicalNodeCore};
 use datafusion::physical_expr::{Distribution, PhysicalExpr};
@@ -27,12 +28,12 @@ use datafusion::physical_plan::{
 use futures::{Stream, StreamExt};
 
 use crate::{
+    DeltaTableError,
     delta_datafusion::get_path_column,
     operations::merge::{TARGET_DELETE_COLUMN, TARGET_INSERT_COLUMN, TARGET_UPDATE_COLUMN},
-    DeltaTableError,
 };
 
-pub(crate) type BarrierSurvivorSet = Arc<Mutex<HashSet<String>>>;
+pub(crate) type BarrierSurvivorSet = Arc<DashSet<String>>;
 
 #[derive(Debug)]
 /// Physical Node for the MergeBarrier
@@ -55,7 +56,7 @@ impl MergeBarrierExec {
         MergeBarrierExec {
             input,
             file_column,
-            survivors: Arc::new(Mutex::new(HashSet::new())),
+            survivors: Arc::new(DashSet::new()),
             expr,
         }
     }
@@ -252,7 +253,7 @@ impl Stream for MergeBarrierStream {
                             // However this approach exposes the cost of hashing so we want to minimize that as much as possible.
                             // A map from an arrow dictionary key to the correct index of `file_partition` is created for each batch that's processed.
                             // This ensures we only need to hash each file path at most once per batch.
-                            let mut key_map = Vec::new();
+                            let mut key_map = Vec::with_capacity(file_dictionary.len());
 
                             for file_name in file_dictionary.values().into_iter() {
                                 let key = match file_name {
@@ -272,9 +273,11 @@ impl Stream for MergeBarrierStream {
                                 key_map.push(key)
                             }
 
-                            let mut indices: Vec<_> = (0..(self.file_partitions.len()))
-                                .map(|_| UInt64Builder::with_capacity(batch.num_rows()))
-                                .collect();
+                            let mut indices: Vec<_> =
+                                Vec::with_capacity(self.file_partitions.len());
+                            for _ in 0..self.file_partitions.len() {
+                                indices.push(UInt64Builder::with_capacity(batch.num_rows()));
+                            }
 
                             for (idx, key) in file_dictionary.keys().iter().enumerate() {
                                 match key {
@@ -299,10 +302,11 @@ impl Stream for MergeBarrierStream {
                                             .columns()
                                             .iter()
                                             .map(|c| {
-                                                arrow::compute::take(c.as_ref(), &indices, None)
-                                                    .map_err(|err| {
-                                                        DataFusionError::ArrowError(err, None)
-                                                    })
+                                                Ok(arrow::compute::take(
+                                                    c.as_ref(),
+                                                    &indices,
+                                                    None,
+                                                )?)
                                             })
                                             .collect::<DataFusionResult<Vec<ArrayRef>>>()?;
 
@@ -358,17 +362,12 @@ impl Stream for MergeBarrierStream {
                     }
 
                     {
-                        let mut lock = self.survivors.lock().map_err(|_| {
-                            DataFusionError::External(Box::new(DeltaTableError::Generic(
-                                "MergeBarrier mutex is poisoned".to_string(),
-                            )))
-                        })?;
                         for part in &self.file_partitions {
                             match part.state {
                                 PartitionBarrierState::Closed => {}
                                 PartitionBarrierState::Open => {
                                     if let Some(file_name) = &part.file_name {
-                                        lock.insert(file_name.to_owned());
+                                        self.survivors.insert(file_name.to_owned());
                                     }
                                 }
                             }
@@ -471,8 +470,8 @@ mod tests {
     use datafusion::datasource::memory::MemorySourceConfig;
     use datafusion::execution::TaskContext;
     use datafusion::physical_expr::expressions::Column;
-    use datafusion::physical_plan::coalesce_batches::CoalesceBatchesExec;
     use datafusion::physical_plan::ExecutionPlan;
+    use datafusion::physical_plan::coalesce_batches::CoalesceBatchesExec;
     use futures::StreamExt;
     use std::sync::Arc;
 
@@ -531,11 +530,10 @@ mod tests {
         ];
         assert_batches_sorted_eq!(&expected, &actual);
 
-        let s = survivors.lock().unwrap();
-        assert!(!s.contains(&"file0".to_string()));
-        assert!(s.contains(&"file1".to_string()));
-        assert!(s.contains(&"file2".to_string()));
-        assert_eq!(s.len(), 2);
+        assert!(!survivors.contains(&"file0".to_string()));
+        assert!(survivors.contains(&"file1".to_string()));
+        assert!(survivors.contains(&"file2".to_string()));
+        assert_eq!(survivors.len(), 2);
     }
 
     #[tokio::test]
@@ -599,17 +597,16 @@ mod tests {
         batches.push(batch);
 
         let (actual, _survivors) = execute(batches).await;
-        let expected = vec!
-            [
-                "+----+-----------------+--------------------------+--------------------------+--------------------------+",
-                "| id | __delta_rs_path | __delta_rs_target_insert | __delta_rs_target_update | __delta_rs_target_delete |",
-                "+----+-----------------+--------------------------+--------------------------+--------------------------+",
-                "| 0  | file0           | false                    | false                    | false                    |",
-                "| 1  | file1           | false                    | false                    | false                    |",
-                "| 2  | file1           | false                    |                          | false                    |",
-                "| 3  | file0           | false                    | false                    |                          |",
-                "+----+-----------------+--------------------------+--------------------------+--------------------------+",
-            ];
+        let expected = vec![
+            "+----+-----------------+--------------------------+--------------------------+--------------------------+",
+            "| id | __delta_rs_path | __delta_rs_target_insert | __delta_rs_target_update | __delta_rs_target_delete |",
+            "+----+-----------------+--------------------------+--------------------------+--------------------------+",
+            "| 0  | file0           | false                    | false                    | false                    |",
+            "| 1  | file1           | false                    | false                    | false                    |",
+            "| 2  | file1           | false                    |                          | false                    |",
+            "| 3  | file0           | false                    | false                    |                          |",
+            "+----+-----------------+--------------------------+--------------------------+--------------------------+",
+        ];
         assert_batches_sorted_eq!(&expected, &actual);
     }
 
