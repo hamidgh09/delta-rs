@@ -4,8 +4,8 @@ use std::any::Any;
 use std::sync::Arc;
 
 pub use delta_kernel::schema::{
-    ArrayType, ColumnMetadataKey, DataType, MapType, MetadataValue, PrimitiveType, StructField,
-    StructType,
+    ArrayType, ColumnMetadataKey, DataType, DecimalType, MapType, MetadataValue, PrimitiveType,
+    StructField, StructType,
 };
 use serde_json::Value;
 
@@ -74,35 +74,11 @@ impl StructTypeExt for StructType {
                 .metadata
                 .get(ColumnMetadataKey::GenerationExpression.as_ref())
             {
-                let json: Value = serde_json::from_str(generated_col_string).map_err(|e| {
-                    Error::InvalidGenerationExpressionJson {
-                        json_err: e,
-                        line: generated_col_string.to_string(),
-                    }
-                })?;
-                match json {
-                    Value::String(sql) => generated_cols.push(GeneratedColumn::new(
-                        &field_path,
-                        &sql,
-                        field.data_type(),
-                    )),
-                    Value::Number(sql) => generated_cols.push(GeneratedColumn::new(
-                        &field_path,
-                        &format!("{sql}"),
-                        field.data_type(),
-                    )),
-                    Value::Bool(sql) => generated_cols.push(GeneratedColumn::new(
-                        &field_path,
-                        &format!("{sql}"),
-                        field.data_type(),
-                    )),
-                    Value::Array(sql) => generated_cols.push(GeneratedColumn::new(
-                        &field_path,
-                        &format!("{sql:?}"),
-                        field.data_type(),
-                    )),
-                    _ => (), // Other types not sure what to do then
-                };
+                generated_cols.push(GeneratedColumn::new(
+                    &field_path,
+                    generated_col_string,
+                    field.data_type(),
+                ));
             }
         }
         Ok(generated_cols)
@@ -168,12 +144,11 @@ impl StructTypeExt for StructType {
                         line: invariant_json.to_string(),
                     }
                 })?;
-                if let Value::Object(json) = json {
-                    if let Some(Value::Object(expr1)) = json.get("expression") {
-                        if let Some(Value::String(sql)) = expr1.get("expression") {
-                            invariants.push(Invariant::new(&field_path, sql));
-                        }
-                    }
+                if let Value::Object(json) = json
+                    && let Some(Value::Object(expr1)) = json.get("expression")
+                    && let Some(Value::String(sql)) = expr1.get("expression")
+                {
+                    invariants.push(Invariant::new(&field_path, sql));
                 }
             }
         }
@@ -206,7 +181,7 @@ mod tests {
                 "type":"struct",
                 "fields":[
                     {"name":"id","type":"integer","nullable":true,"metadata":{}},
-                    {"name":"gc","type":"integer","nullable":true,"metadata":{"delta.generationExpression":"\"5\""}}]
+                    {"name":"gc","type":"integer","nullable":true,"metadata":{"delta.generationExpression":"5"}}]
             }
         )).unwrap();
         let cols = schema.get_generated_columns().unwrap();
@@ -219,8 +194,8 @@ mod tests {
                 "type":"struct",
                 "fields":[
                     {"name":"id","type":"integer","nullable":true,"metadata":{}},
-                    {"name":"gc","type":"integer","nullable":true,"metadata":{"delta.generationExpression":"\"5\""}},
-                    {"name":"id2","type":"integer","nullable":true,"metadata":{"delta.generationExpression":"\"id * 10\""}},]
+                    {"name":"gc","type":"integer","nullable":true,"metadata":{"delta.generationExpression":"5"}},
+                    {"name":"id2","type":"integer","nullable":true,"metadata":{"delta.generationExpression":"id * 10"}},]
             }
         )).unwrap();
         let cols = schema.get_generated_columns().unwrap();

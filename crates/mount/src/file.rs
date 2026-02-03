@@ -5,11 +5,11 @@
 use bytes::Bytes;
 use futures::stream::BoxStream;
 use object_store::{
-    local::LocalFileSystem, path::Path as ObjectStorePath, Error as ObjectStoreError, GetOptions,
-    GetResult, ListResult, ObjectMeta, ObjectStore, PutOptions, PutResult,
-    Result as ObjectStoreResult,
+    Error as ObjectStoreError, GetOptions, GetResult, ListResult, ObjectMeta, ObjectStore,
+    PutOptions, PutResult, Result as ObjectStoreResult, local::LocalFileSystem,
+    path::Path as ObjectStorePath,
 };
-use object_store::{MultipartUpload, PutMode, PutMultipartOpts, PutPayload};
+use object_store::{MultipartUpload, PutMode, PutMultipartOptions, PutPayload};
 use std::ops::Range;
 use std::sync::Arc;
 
@@ -235,7 +235,7 @@ impl ObjectStore for MountFileStorageBackend {
     async fn put_multipart_opts(
         &self,
         location: &ObjectStorePath,
-        options: PutMultipartOpts,
+        options: PutMultipartOptions,
     ) -> ObjectStoreResult<Box<dyn MultipartUpload>> {
         self.inner.put_multipart_opts(location, options).await
     }
@@ -302,8 +302,9 @@ mod tests {
         assert!(a.exists());
         assert!(!c.exists());
         match regular_rename(a.to_str().unwrap(), c.to_str().unwrap()).await {
-            Err(LocalFileSystemError::InvalidArgument {source, ..}) =>
-                panic!("expected success, got: {source:?}. Note: atomically renaming Windows files from WSL2 is not supported."),
+            Err(LocalFileSystemError::InvalidArgument { source, .. }) => panic!(
+                "expected success, got: {source:?}. Note: atomically renaming Windows files from WSL2 is not supported."
+            ),
             Err(e) => panic!("expected success, got: {e:?}"),
             _ => {}
         }

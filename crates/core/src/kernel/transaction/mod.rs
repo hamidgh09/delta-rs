@@ -79,14 +79,15 @@ use std::sync::Arc;
 use bytes::Bytes;
 use chrono::Utc;
 use conflict_checker::ConflictChecker;
+use delta_kernel::table_properties::TableProperties;
 use futures::future::BoxFuture;
-use object_store::path::Path;
 use object_store::Error as ObjectStoreError;
+use object_store::path::Path;
 use serde_json::Value;
 use tracing::*;
 use uuid::Uuid;
 
-use delta_kernel::table_features::{ReaderFeature, WriterFeature};
+use delta_kernel::table_features::TableFeature;
 use serde::{Deserialize, Serialize};
 
 use self::conflict_checker::{TransactionInfo, WinningCommitSummary};
@@ -97,9 +98,9 @@ use crate::logstore::{CommitOrBytes, LogStoreRef};
 use crate::operations::CustomExecuteHandler;
 use crate::protocol::DeltaOperation;
 use crate::protocol::{cleanup_expired_logs_for, create_checkpoint_for};
-use crate::table::config::TableConfig;
+use crate::table::config::TablePropertiesExt as _;
 use crate::table::state::DeltaTableState;
-use crate::{crate_version, DeltaResult};
+use crate::{DeltaResult, crate_version};
 
 pub use self::conflict_checker::CommitConflictError;
 pub use self::protocol::INSTANCE as PROTOCOL;
@@ -180,21 +181,13 @@ pub enum TransactionError {
     )]
     DeltaTableAppendOnly,
 
-    /// Error returned when unsupported reader features are required
-    #[error("Unsupported reader features required: {0:?}")]
-    UnsupportedReaderFeatures(Vec<ReaderFeature>),
+    /// Error returned when unsupported table features are required
+    #[error("Unsupported table features required: {0:?}")]
+    UnsupportedTableFeatures(Vec<TableFeature>),
 
-    /// Error returned when unsupported writer features are required
-    #[error("Unsupported writer features required: {0:?}")]
-    UnsupportedWriterFeatures(Vec<WriterFeature>),
-
-    /// Error returned when writer features are required but not specified
-    #[error("Writer features must be specified for writerversion >= 7, please specify: {0:?}")]
-    WriterFeaturesRequired(WriterFeature),
-
-    /// Error returned when reader features are required but not specified
-    #[error("Reader features must be specified for reader version >= 3, please specify: {0:?}")]
-    ReaderFeaturesRequired(ReaderFeature),
+    /// Error returned when table features are required but not specified
+    #[error("Table features must be specified, please specify: {0:?}")]
+    TableFeaturesRequired(TableFeature),
 
     /// The transaction failed to commit due to an error in an implementation-specific layer.
     /// Currently used by DynamoDb-backed S3 log store when database operations fail.
@@ -235,7 +228,7 @@ impl From<CommitBuilderError> for DeltaTableError {
 /// Reference to some structure that contains mandatory attributes for performing a commit.
 pub trait TableReference: Send + Sync {
     /// Well known table configuration
-    fn config(&self) -> TableConfig;
+    fn config(&self) -> &TableProperties;
 
     /// Get the table protocol of the snapshot
     fn protocol(&self) -> &Protocol;
@@ -256,8 +249,8 @@ impl TableReference for EagerSnapshot {
         EagerSnapshot::metadata(self)
     }
 
-    fn config(&self) -> TableConfig {
-        self.table_config()
+    fn config(&self) -> &TableProperties {
+        self.table_properties()
     }
 
     fn eager_snapshot(&self) -> &EagerSnapshot {
@@ -266,7 +259,7 @@ impl TableReference for EagerSnapshot {
 }
 
 impl TableReference for DeltaTableState {
-    fn config(&self) -> TableConfig {
+    fn config(&self) -> &TableProperties {
         self.snapshot.config()
     }
 
@@ -313,7 +306,8 @@ impl CommitData {
             );
             app_metadata.extend(commit_info.info);
             commit_info.info = app_metadata.clone();
-            actions.push(Action::CommitInfo(commit_info))
+            // commit info should be the first action to support in-commit timestamps.
+            actions.insert(0, Action::CommitInfo(commit_info));
         }
 
         for txn in &app_transactions {
@@ -617,121 +611,200 @@ impl<'a> std::future::IntoFuture for PreparedCommit<'a> {
         Box::pin(async move {
             let commit_or_bytes = this.commit_or_bytes;
 
-            if this.table_data.is_none() {
-                this.log_store
-                    .write_commit_entry(0, commit_or_bytes.clone(), this.operation_id)
-                    .await?;
-                return Ok(PostCommit {
-                    version: 0,
-                    data: this.data,
-                    create_checkpoint: false,
-                    cleanup_expired_logs: None,
-                    log_store: this.log_store,
-                    table_data: None,
-                    custom_execute_handler: this.post_commit_hook_handler,
-                    metrics: CommitMetrics { num_retries: 0 },
-                });
-            }
+            let mut attempt_number: usize = 1;
 
-            // unwrap() is safe here due to the above check
-            let mut read_snapshot = this.table_data.unwrap().eager_snapshot().clone();
-
-            let mut attempt_number = 1;
-            let total_retries = this.max_retries + 1;
-            while attempt_number <= total_retries {
-                let latest_version = this
-                    .log_store
-                    .get_latest_version(read_snapshot.version())
-                    .await?;
-
-                if latest_version > read_snapshot.version() {
-                    // If max_retries are set to 0, do not try to use the conflict checker to resolve the conflict
-                    // and throw immediately
-                    if this.max_retries == 0 {
-                        return Err(
-                            TransactionError::MaxCommitAttempts(this.max_retries as i32).into()
-                        );
-                    }
-                    warn!("Attempting to write a transaction {} but the underlying table has been updated to {latest_version}\n{:?}", read_snapshot.version() + 1, this.log_store);
-                    let mut steps = latest_version - read_snapshot.version();
-
-                    // Need to check for conflicts with each version between the read_snapshot and
-                    // the latest!
-                    while steps != 0 {
-                        let summary = WinningCommitSummary::try_new(
-                            this.log_store.as_ref(),
-                            latest_version - steps,
-                            (latest_version - steps) + 1,
-                        )
-                        .await?;
-                        let transaction_info = TransactionInfo::try_new(
-                            &read_snapshot,
-                            this.data.operation.read_predicate(),
-                            &this.data.actions,
-                            this.data.operation.read_whole_table(),
-                        )?;
-                        let conflict_checker = ConflictChecker::new(
-                            transaction_info,
-                            summary,
-                            Some(&this.data.operation),
-                        );
-
-                        match conflict_checker.check_conflicts() {
-                            Ok(_) => {}
-                            Err(err) => {
-                                return Err(TransactionError::CommitConflict(err).into());
-                            }
-                        }
-                        steps -= 1;
-                    }
-                    // Update snapshot to latest version after successful conflict check
-                    read_snapshot
-                        .update(&this.log_store, Some(latest_version))
-                        .await?;
-                }
-                let version: i64 = latest_version + 1;
-
+            // Handle the case where table doesn't exist yet (initial table creation)
+            let read_snapshot: EagerSnapshot = if this.table_data.is_none() {
+                debug!("committing initial table version 0");
                 match this
                     .log_store
-                    .write_commit_entry(version, commit_or_bytes.clone(), this.operation_id)
+                    .write_commit_entry(0, commit_or_bytes.clone(), this.operation_id)
                     .await
                 {
-                    Ok(()) => {
+                    Ok(_) => {
                         return Ok(PostCommit {
-                            version,
+                            version: 0,
                             data: this.data,
-                            create_checkpoint: this
-                                .post_commit
-                                .map(|v| v.create_checkpoint)
-                                .unwrap_or_default(),
-                            cleanup_expired_logs: this
-                                .post_commit
-                                .map(|v| v.cleanup_expired_logs)
-                                .unwrap_or_default(),
+                            create_checkpoint: false,
+                            cleanup_expired_logs: None,
                             log_store: this.log_store,
-                            table_data: Some(Box::new(read_snapshot)),
+                            table_data: None,
                             custom_execute_handler: this.post_commit_hook_handler,
-                            metrics: CommitMetrics {
-                                num_retries: attempt_number as u64 - 1,
-                            },
+                            metrics: CommitMetrics { num_retries: 0 },
                         });
                     }
-                    Err(TransactionError::VersionAlreadyExists(version)) => {
-                        error!("The transaction {version} already exists, will retry!");
-                        // If the version already exists, loop through again and re-check
-                        // conflicts
-                        attempt_number += 1;
+                    Err(TransactionError::VersionAlreadyExists(0)) => {
+                        // Table was created by another writer since the `this.table_data.is_none()` check.
+                        // Load the current table state and continue with the retry loop.
+                        debug!("version 0 already exists, loading table state for retry");
+                        attempt_number = 2;
+                        let latest_version = this.log_store.get_latest_version(0).await?;
+                        EagerSnapshot::try_new(
+                            this.log_store.as_ref(),
+                            Default::default(),
+                            Some(latest_version),
+                        )
+                        .await?
                     }
-                    Err(err) => {
-                        this.log_store
-                            .abort_commit_entry(version, commit_or_bytes, this.operation_id)
+                    Err(e) => return Err(e.into()),
+                }
+            } else {
+                this.table_data.unwrap().eager_snapshot().clone()
+            };
+
+            let mut read_snapshot = read_snapshot;
+
+            let commit_span = info_span!(
+                "commit_with_retries",
+                base_version = read_snapshot.version(),
+                max_retries = this.max_retries,
+                attempt = field::Empty,
+                target_version = field::Empty,
+                conflicts_checked = 0
+            );
+
+            async move {
+                let total_retries = this.max_retries + 1;
+                while attempt_number <= total_retries {
+                    Span::current().record("attempt", attempt_number);
+                    let latest_version = this
+                        .log_store
+                        .get_latest_version(read_snapshot.version())
+                        .await?;
+
+                    if latest_version > read_snapshot.version() {
+                        // If max_retries are set to 0, do not try to use the conflict checker to resolve the conflict
+                        // and throw immediately
+                        if this.max_retries == 0 {
+                            warn!(
+                                base_version = read_snapshot.version(),
+                                latest_version = latest_version,
+                                "table updated but max_retries is 0, failing immediately"
+                            );
+                            return Err(TransactionError::MaxCommitAttempts(
+                                this.max_retries as i32,
+                            )
+                            .into());
+                        }
+                        warn!(
+                            base_version = read_snapshot.version(),
+                            latest_version = latest_version,
+                            versions_behind = latest_version - read_snapshot.version(),
+                            "table updated during transaction, checking for conflicts"
+                        );
+                        let mut steps = latest_version - read_snapshot.version();
+                        let mut conflicts_checked = 0;
+
+                        // Need to check for conflicts with each version between the read_snapshot and
+                        // the latest!
+                        while steps != 0 {
+                            conflicts_checked += 1;
+                            let summary = WinningCommitSummary::try_new(
+                                this.log_store.as_ref(),
+                                latest_version - steps,
+                                (latest_version - steps) + 1,
+                            )
                             .await?;
-                        return Err(err.into());
+                            let transaction_info = TransactionInfo::try_new(
+                                read_snapshot.log_data(),
+                                this.data.operation.read_predicate(),
+                                &this.data.actions,
+                                this.data.operation.read_whole_table(),
+                            )?;
+                            let conflict_checker = ConflictChecker::new(
+                                transaction_info,
+                                summary,
+                                Some(&this.data.operation),
+                            );
+
+                            match conflict_checker.check_conflicts() {
+                                Ok(_) => {}
+                                Err(err) => {
+                                    error!(
+                                        conflicts_checked = conflicts_checked,
+                                        error = %err,
+                                        "conflict detected, aborting transaction"
+                                    );
+                                    return Err(TransactionError::CommitConflict(err).into());
+                                }
+                            }
+                            steps -= 1;
+                        }
+                        Span::current().record("conflicts_checked", conflicts_checked);
+                        debug!(
+                            conflicts_checked = conflicts_checked,
+                            "all conflicts resolved, updating snapshot"
+                        );
+                        // Update snapshot to latest version after successful conflict check
+                        read_snapshot
+                            .update(&this.log_store, Some(latest_version as u64))
+                            .await?;
+                    }
+                    let version: i64 = latest_version + 1;
+                    Span::current().record("target_version", version);
+
+                    match this
+                        .log_store
+                        .write_commit_entry(version, commit_or_bytes.clone(), this.operation_id)
+                        .await
+                    {
+                        Ok(()) => {
+                            info!(
+                                version = version,
+                                num_retries = attempt_number as u64 - 1,
+                                "transaction committed successfully"
+                            );
+                            return Ok(PostCommit {
+                                version,
+                                data: this.data,
+                                create_checkpoint: this
+                                    .post_commit
+                                    .map(|v| v.create_checkpoint)
+                                    .unwrap_or_default(),
+                                cleanup_expired_logs: this
+                                    .post_commit
+                                    .map(|v| v.cleanup_expired_logs)
+                                    .unwrap_or_default(),
+                                log_store: this.log_store,
+                                table_data: Some(Box::new(read_snapshot)),
+                                custom_execute_handler: this.post_commit_hook_handler,
+                                metrics: CommitMetrics {
+                                    num_retries: attempt_number as u64 - 1,
+                                },
+                            });
+                        }
+                        Err(TransactionError::VersionAlreadyExists(version)) => {
+                            warn!(
+                                version = version,
+                                attempt = attempt_number,
+                                "version already exists, will retry"
+                            );
+                            // If the version already exists, loop through again and re-check
+                            // conflicts
+                            attempt_number += 1;
+                        }
+                        Err(err) => {
+                            error!(
+                                version = version,
+                                error = %err,
+                                "commit failed, aborting"
+                            );
+                            this.log_store
+                                .abort_commit_entry(version, commit_or_bytes, this.operation_id)
+                                .await?;
+                            return Err(err.into());
+                        }
                     }
                 }
-            }
 
-            Err(TransactionError::MaxCommitAttempts(this.max_retries as i32).into())
+                error!(
+                    max_retries = this.max_retries,
+                    "exceeded maximum commit attempts"
+                );
+                Err(TransactionError::MaxCommitAttempts(this.max_retries as i32).into())
+            }
+            .instrument(commit_span)
+            .await
         })
     }
 }
@@ -756,16 +829,12 @@ impl PostCommit {
         if let Some(table) = &self.table_data {
             let post_commit_operation_id = Uuid::new_v4();
             let mut snapshot = table.eager_snapshot().clone();
-            if self.version - snapshot.version() > 1 {
-                // This may only occur during concurrent write actions. We need to update the state first to - 1
-                // then we can advance.
+            if self.version != snapshot.version() {
                 snapshot
-                    .update(&self.log_store, Some(self.version - 1))
+                    .update(&self.log_store, Some(self.version as u64))
                     .await?;
-                snapshot.advance(vec![&self.data])?;
-            } else {
-                snapshot.advance(vec![&self.data])?;
             }
+
             let mut state = DeltaTableState { snapshot };
 
             let cleanup_logs = if let Some(cleanup_logs) = self.cleanup_expired_logs {
@@ -857,11 +926,13 @@ impl PostCommit {
         operation_id: Uuid,
     ) -> DeltaResult<bool> {
         if !table_state.load_config().require_files {
-            warn!("Checkpoint creation in post_commit_hook has been skipped due to table being initialized without files.");
+            warn!(
+                "Checkpoint creation in post_commit_hook has been skipped due to table being initialized without files."
+            );
             return Ok(false);
         }
 
-        let checkpoint_interval = table_state.config().checkpoint_interval() as i64;
+        let checkpoint_interval = table_state.config().checkpoint_interval().get() as i64;
         if ((version + 1) % checkpoint_interval) == 0 {
             create_checkpoint_for(version as u64, log_store.as_ref(), Some(operation_id)).await?;
             Ok(true)
@@ -881,6 +952,15 @@ pub struct FinalizedCommit {
 
     /// Metrics associated with the commit operation
     pub metrics: Metrics,
+}
+
+impl std::fmt::Debug for FinalizedCommit {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FinalizedCommit")
+            .field("version", &self.version)
+            .field("metrics", &self.metrics)
+            .finish()
+    }
 }
 
 impl FinalizedCommit {
@@ -923,8 +1003,10 @@ mod tests {
     use std::sync::Arc;
 
     use super::*;
-    use crate::logstore::{commit_uri_from_version, default_logstore::DefaultLogStore, LogStore};
-    use object_store::{memory::InMemory, ObjectStore, PutPayload};
+    use crate::logstore::{
+        LogStore, StorageConfig, commit_uri_from_version, default_logstore::DefaultLogStore,
+    };
+    use object_store::{ObjectStore, PutPayload, memory::InMemory};
     use url::Url;
 
     #[test]
@@ -942,10 +1024,7 @@ mod tests {
         let log_store = DefaultLogStore::new(
             store.clone(),
             store.clone(),
-            crate::logstore::LogStoreConfig {
-                location: url,
-                options: Default::default(),
-            },
+            crate::logstore::LogStoreConfig::new(&url, StorageConfig::default()),
         );
         let version_path = Path::from("_delta_log/00000000000000000000.json");
         store.put(&version_path, PutPayload::new()).await.unwrap();
@@ -969,5 +1048,42 @@ mod tests {
             )
             .await
             .unwrap();
+    }
+
+    #[test]
+    fn test_commit_with_retries_tracing_span() {
+        let span = info_span!(
+            "commit_with_retries",
+            base_version = 5,
+            max_retries = 10,
+            attempt = field::Empty,
+            target_version = field::Empty,
+            conflicts_checked = 0
+        );
+
+        let metadata = span.metadata().expect("span should have metadata");
+        assert_eq!(metadata.name(), "commit_with_retries");
+        assert_eq!(metadata.level(), &Level::INFO);
+        assert!(metadata.is_span());
+
+        span.record("attempt", 1);
+        span.record("target_version", 6);
+        span.record("conflicts_checked", 2);
+    }
+
+    #[test]
+    fn test_commit_properties_with_retries() {
+        let props = CommitProperties::default()
+            .with_max_retries(5)
+            .with_create_checkpoint(false);
+
+        assert_eq!(props.max_retries, 5);
+        assert!(!props.create_checkpoint);
+    }
+
+    #[test]
+    fn test_commit_metrics() {
+        let metrics = CommitMetrics { num_retries: 3 };
+        assert_eq!(metrics.num_retries, 3);
     }
 }

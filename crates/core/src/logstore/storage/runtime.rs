@@ -3,16 +3,16 @@ use std::sync::OnceLock;
 
 use bytes::Bytes;
 use deltalake_derive::DeltaConfig;
-use futures::future::BoxFuture;
-use futures::stream::BoxStream;
 use futures::FutureExt;
 use futures::TryFutureExt;
+use futures::future::BoxFuture;
+use futures::stream::BoxStream;
 use object_store::path::Path;
 use object_store::{
     Error as ObjectStoreError, GetOptions, GetResult, ListResult, ObjectMeta, ObjectStore,
     PutOptions, PutPayload, PutResult, Result as ObjectStoreResult,
 };
-use object_store::{MultipartUpload, PutMultipartOpts};
+use object_store::{MultipartUpload, PutMultipartOptions};
 use serde::{Deserialize, Serialize};
 use tokio::runtime::{Builder as RuntimeBuilder, Handle, Runtime};
 
@@ -307,7 +307,7 @@ impl<T: ObjectStore + Clone> ObjectStore for DeltaIOStorageBackend<T> {
     async fn put_multipart_opts(
         &self,
         location: &Path,
-        options: PutMultipartOpts,
+        options: PutMultipartOptions,
     ) -> ObjectStoreResult<Box<dyn MultipartUpload>> {
         self.spawn_io_rt(
             |store, path| store.put_multipart_opts(path, options),

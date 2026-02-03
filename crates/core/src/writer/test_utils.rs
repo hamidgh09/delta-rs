@@ -1,19 +1,17 @@
 //! Utilities for writing unit tests
 
-use std::collections::HashMap;
 use std::sync::Arc;
 
 use arrow_array::{Int32Array, Int64Array, RecordBatch, StringArray, StructArray, UInt32Array};
 use arrow_schema::{DataType, Field, Schema as ArrowSchema};
 use arrow_select::take::take;
+use url::Url;
 
 use crate::kernel::{
-    new_metadata, DataType as DeltaDataType, Metadata, PrimitiveType, StructField, StructType,
+    DataType as DeltaDataType, Metadata, PrimitiveType, StructField, StructType, new_metadata,
 };
 use crate::operations::create::CreateBuilder;
-use crate::operations::DeltaOps;
 use crate::{DeltaTable, DeltaTableBuilder, TableProperty};
-
 pub type TestResult = Result<(), Box<dyn std::error::Error + 'static>>;
 
 pub fn get_record_batch(part: Option<String>, with_null: bool) -> RecordBatch {
@@ -134,7 +132,7 @@ fn data_without_null() -> (Int32Array, StringArray, StringArray) {
 }
 
 pub fn get_delta_schema() -> StructType {
-    StructType::new(vec![
+    StructType::try_new(vec![
         StructField::new(
             "id".to_string(),
             DeltaDataType::Primitive(PrimitiveType::String),
@@ -151,6 +149,7 @@ pub fn get_delta_schema() -> StructType {
             true,
         ),
     ])
+    .unwrap()
 }
 
 pub fn get_delta_metadata(partition_cols: &[String]) -> Metadata {
@@ -248,7 +247,7 @@ pub fn get_record_batch_with_nested_struct() -> RecordBatch {
 }
 
 pub fn get_delta_schema_with_nested_struct() -> StructType {
-    StructType::new(vec![
+    StructType::try_new(vec![
         StructField::new(
             "id".to_string(),
             DeltaDataType::Primitive(PrimitiveType::String),
@@ -266,14 +265,18 @@ pub fn get_delta_schema_with_nested_struct() -> StructType {
         ),
         StructField::new(
             String::from("nested"),
-            DeltaDataType::Struct(Box::new(StructType::new(vec![StructField::new(
-                String::from("count"),
-                DeltaDataType::Primitive(PrimitiveType::Integer),
-                true,
-            )]))),
+            DeltaDataType::Struct(Box::new(
+                StructType::try_new(vec![StructField::new(
+                    String::from("count"),
+                    DeltaDataType::Primitive(PrimitiveType::Integer),
+                    true,
+                )])
+                .unwrap(),
+            )),
             true,
         ),
     ])
+    .unwrap()
 }
 
 pub async fn setup_table_with_configuration(
@@ -281,7 +284,7 @@ pub async fn setup_table_with_configuration(
     value: Option<impl Into<String>>,
 ) -> DeltaTable {
     let table_schema = get_delta_schema();
-    DeltaOps::new_in_memory()
+    DeltaTable::new_in_memory()
         .create()
         .with_columns(table_schema.fields().cloned())
         .with_configuration_property(key, value)
@@ -292,7 +295,9 @@ pub async fn setup_table_with_configuration(
 pub fn create_bare_table() -> DeltaTable {
     let table_dir = tempfile::tempdir().unwrap();
     let table_path = table_dir.path();
-    DeltaTableBuilder::from_uri(table_path.to_str().unwrap())
+    let table_uri = Url::from_directory_path(table_path).unwrap();
+    DeltaTableBuilder::from_url(table_uri)
+        .unwrap()
         .build()
         .unwrap()
 }
@@ -311,18 +316,19 @@ pub async fn create_initialized_table(table_path: &str, partition_cols: &[String
 
 #[cfg(feature = "datafusion")]
 pub mod datafusion {
-    use crate::operations::DeltaOps;
-    use crate::writer::SaveMode;
-    use crate::DeltaTable;
     use arrow_array::RecordBatch;
     use datafusion::prelude::SessionContext;
-    use std::sync::Arc;
+
+    use crate::DeltaTable;
+    use crate::writer::SaveMode;
 
     pub async fn get_data(table: &DeltaTable) -> Vec<RecordBatch> {
         let table =
             DeltaTable::new_with_state(table.log_store.clone(), table.snapshot().unwrap().clone());
         let ctx = SessionContext::new();
-        ctx.register_table("test", Arc::new(table)).unwrap();
+        table.update_datafusion_session(&ctx.state()).unwrap();
+        ctx.register_table("test", table.table_provider().await.unwrap())
+            .unwrap();
         ctx.sql("select * from test")
             .await
             .unwrap()
@@ -337,7 +343,9 @@ pub mod datafusion {
             table.state.as_ref().unwrap().clone(),
         );
         let ctx = SessionContext::new();
-        ctx.register_table("test", Arc::new(table)).unwrap();
+        table.update_datafusion_session(&ctx.state()).unwrap();
+        ctx.register_table("test", table.table_provider().await.unwrap())
+            .unwrap();
         ctx.sql(&format!("select {columns} from test order by {columns}"))
             .await
             .unwrap()
@@ -347,7 +355,7 @@ pub mod datafusion {
     }
 
     pub async fn write_batch(table: DeltaTable, batch: RecordBatch) -> DeltaTable {
-        DeltaOps(table)
+        table
             .write(vec![batch.clone()])
             .with_save_mode(SaveMode::Append)
             .await

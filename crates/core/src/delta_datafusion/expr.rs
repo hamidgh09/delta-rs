@@ -21,13 +21,15 @@
 
 //! Utility functions for Datafusion's Expressions
 use std::fmt::{self, Display, Error, Formatter, Write};
+use std::marker::PhantomData;
 use std::sync::Arc;
 
 use arrow_array::{Array, GenericListArray};
 use arrow_schema::{DataType, Field};
 use chrono::{DateTime, NaiveDate};
+use datafusion::catalog::Session;
 use datafusion::common::Result as DFResult;
-use datafusion::common::{config::ConfigOptions, DFSchema, Result, ScalarValue, TableReference};
+use datafusion::common::{DFSchema, Result, ScalarValue, TableReference, config::ConfigOptions};
 use datafusion::execution::context::SessionState;
 use datafusion::execution::session_state::SessionStateBuilder;
 use datafusion::functions_nested::make_array::MakeArray;
@@ -47,12 +49,12 @@ use datafusion::sql::sqlparser::parser::Parser;
 use datafusion::sql::sqlparser::tokenizer::Tokenizer;
 use tracing::log::*;
 
-use super::DeltaParserOptions;
+use crate::delta_datafusion::session::DeltaParserOptions;
 use crate::{DeltaResult, DeltaTableError};
 
 /// This struct is like Datafusion's MakeArray but ensures that `element` is used rather than `item
 /// as the field name within the list.
-#[derive(Debug)]
+#[derive(Debug, Hash, PartialEq, Eq)]
 struct MakeParquetArray {
     /// The actual upstream UDF, which we're just totally cheating and using
     actual: MakeArray,
@@ -186,30 +188,35 @@ impl ExprPlanner for CustomNestedFunctionPlanner {
 
 pub(crate) struct DeltaContextProvider<'a> {
     state: SessionState,
-    /// Keeping this around just to make use of the 'a lifetime
-    _original: &'a SessionState,
     planners: Vec<Arc<dyn ExprPlanner>>,
+    /// Keeping this around just to make use of the 'a lifetime
+    _phantom: PhantomData<&'a SessionState>,
 }
 
 impl<'a> DeltaContextProvider<'a> {
-    fn new(state: &'a SessionState) -> Self {
+    fn new(session: &'a dyn Session) -> Self {
         // default planners are [CoreFunctionPlanner, NestedFunctionPlanner, FieldAccessPlanner,
         // UserDefinedFunctionPlanner]
         let planners: Vec<Arc<dyn ExprPlanner>> = vec![
             Arc::new(CoreFunctionPlanner::default()),
             Arc::new(CustomNestedFunctionPlanner::default()),
             Arc::new(FieldAccessPlanner),
-            Arc::new(datafusion::functions::planner::UserDefinedFunctionPlanner),
+            Arc::new(datafusion::functions::unicode::planner::UnicodeFunctionPlanner),
+            Arc::new(datafusion::functions::datetime::planner::DatetimeFunctionPlanner),
         ];
         // Disable the above for testing
         //let planners = state.expr_planners();
-        let new_state = SessionStateBuilder::new_from_existing(state.clone())
+        let new_state = session
+            .as_any()
+            .downcast_ref::<SessionState>()
+            .map(|state| SessionStateBuilder::new_from_existing(state.clone()))
+            .unwrap_or_default()
             .with_expr_planners(planners.clone())
             .build();
         DeltaContextProvider {
             planners,
             state: new_state,
-            _original: state,
+            _phantom: PhantomData,
         }
     }
 }
@@ -260,7 +267,7 @@ impl ContextProvider for DeltaContextProvider<'_> {
 pub fn parse_predicate_expression(
     schema: &DFSchema,
     expr: impl AsRef<str>,
-    df_state: &SessionState,
+    session: &dyn Session,
 ) -> DeltaResult<Expr> {
     let dialect = &GenericDialect {};
     let mut tokenizer = Tokenizer::new(dialect, expr.as_ref());
@@ -276,7 +283,7 @@ pub fn parse_predicate_expression(
             source: Box::new(err),
         })?;
 
-    let context_provider = DeltaContextProvider::new(df_state);
+    let context_provider = DeltaContextProvider::new(session);
     let sql_to_rel =
         SqlToRel::new_with_options(&context_provider, DeltaParserOptions::default().into());
 
@@ -478,7 +485,7 @@ macro_rules! format_option {
     }};
 }
 
-/// Epoch days from ce calander until 1970-01-01
+/// Epoch days from ce calendar until 1970-01-01
 pub const EPOCH_DAYS_FROM_CE: i32 = 719_163;
 
 struct ScalarValueFormat<'a> {
@@ -579,12 +586,12 @@ mod test {
     use datafusion::functions_nested::expr_ext::{IndexAccessor, SliceAccessor};
     use datafusion::functions_nested::expr_fn::cardinality;
     use datafusion::logical_expr::expr::ScalarFunction;
-    use datafusion::logical_expr::{col, lit, BinaryExpr, Cast, Expr, ExprSchemable};
+    use datafusion::logical_expr::{BinaryExpr, Cast, Expr, ExprSchemable, col, lit};
     use datafusion::prelude::SessionContext;
 
+    use crate::DeltaTable;
     use crate::delta_datafusion::{DataFusionMixins, DeltaSessionContext};
     use crate::kernel::{ArrayType, DataType, PrimitiveType, StructField, StructType};
-    use crate::{DeltaOps, DeltaTable};
 
     use super::fmt_expr_to_sql;
 
@@ -605,7 +612,7 @@ mod test {
     }
 
     async fn setup_table() -> DeltaTable {
-        let schema = StructType::new(vec![
+        let schema = StructType::try_new(vec![
             StructField::new(
                 "id".to_string(),
                 DataType::Primitive(PrimitiveType::String),
@@ -668,18 +675,24 @@ mod test {
             ),
             StructField::new(
                 "_struct".to_string(),
-                DataType::Struct(Box::new(StructType::new(vec![
-                    StructField::new("a", DataType::Primitive(PrimitiveType::Integer), true),
-                    StructField::new(
-                        "nested",
-                        DataType::Struct(Box::new(StructType::new(vec![StructField::new(
-                            "b",
-                            DataType::Primitive(PrimitiveType::Integer),
+                DataType::Struct(Box::new(
+                    StructType::try_new(vec![
+                        StructField::new("a", DataType::Primitive(PrimitiveType::Integer), true),
+                        StructField::new(
+                            "nested",
+                            DataType::Struct(Box::new(
+                                StructType::try_new(vec![StructField::new(
+                                    "b",
+                                    DataType::Primitive(PrimitiveType::Integer),
+                                    true,
+                                )])
+                                .unwrap(),
+                            )),
                             true,
-                        )]))),
-                        true,
-                    ),
-                ]))),
+                        ),
+                    ])
+                    .unwrap(),
+                )),
                 true,
             ),
             StructField::new(
@@ -690,9 +703,10 @@ mod test {
                 ))),
                 true,
             ),
-        ]);
+        ])
+        .unwrap();
 
-        let table = DeltaOps::new_in_memory()
+        let table = DeltaTable::new_in_memory()
             .create()
             .with_columns(schema.fields().cloned())
             .await
@@ -809,8 +823,8 @@ mod test {
                         &table
                             .snapshot()
                             .unwrap()
+                            .snapshot()
                             .input_schema()
-                            .unwrap()
                             .as_ref()
                             .to_owned()
                             .to_dfschema()
@@ -919,6 +933,7 @@ mod test {
             let actual_expr = table
                 .snapshot()
                 .unwrap()
+                .snapshot()
                 .parse_predicate_expression(actual, &session.state())
                 .unwrap();
 

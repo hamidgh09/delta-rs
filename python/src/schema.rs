@@ -12,16 +12,17 @@ use deltalake::kernel::{
 };
 use pyo3::exceptions::{PyException, PyNotImplementedError, PyTypeError, PyValueError};
 use pyo3::types::PyCapsule;
-use pyo3::{prelude::*, IntoPyObjectExt};
-use pyo3_arrow::error::PyArrowResult;
-use pyo3_arrow::export::{Arro3DataType, Arro3Field, Arro3Schema};
-use pyo3_arrow::ffi::to_schema_pycapsule;
+use pyo3::{IntoPyObjectExt, prelude::*};
 use pyo3_arrow::PyDataType;
 use pyo3_arrow::PyField;
 use pyo3_arrow::PySchema as PyArrow3Schema;
+use pyo3_arrow::error::PyArrowResult;
+use pyo3_arrow::export::{Arro3DataType, Arro3Field, Arro3Schema};
+use pyo3_arrow::ffi::to_schema_pycapsule;
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use crate::error::SchemaMismatchError;
 use crate::utils::warn;
 
 // PyO3 doesn't yet support converting classes with inheritance with Python
@@ -47,6 +48,9 @@ fn schema_type_to_python(schema_type: DataType, py: Python<'_>) -> PyResult<Boun
         DataType::Struct(struct_type) => {
             let struct_type: StructType = (*struct_type).into();
             Ok(struct_type.into_py_any(py)?.into_bound(py))
+        }
+        DataType::Variant(_) => {
+            unimplemented!("Variant type not yet supported")
         }
     }
 }
@@ -633,7 +637,8 @@ impl StructType {
             .into_iter()
             .map(|field| field.inner.clone())
             .collect();
-        let inner_type = DeltaStructType::new(fields);
+        let inner_type =
+            DeltaStructType::try_new(fields).expect("Failed to construct a StructType");
         Self { inner_type }
     }
 
@@ -720,7 +725,10 @@ impl StructType {
     }
 }
 
-pub fn schema_to_pyobject(schema: DeltaStructType, py: Python<'_>) -> PyResult<Bound<'_, PyAny>> {
+pub fn schema_to_pyobject(
+    schema: Arc<DeltaStructType>,
+    py: Python<'_>,
+) -> PyResult<Bound<'_, PyAny>> {
     let fields = schema.fields().map(|field| Field {
         inner: field.clone(),
     });
@@ -754,7 +762,8 @@ impl PySchema {
             .into_iter()
             .map(|field| field.inner.clone())
             .collect();
-        let inner_type = DeltaStructType::new(fields);
+        let inner_type = DeltaStructType::try_new(fields)
+            .map_err(|e| SchemaMismatchError::new_err(e.to_string()))?;
         Ok((Self {}, StructType { inner_type }))
     }
 
@@ -877,7 +886,7 @@ impl PySchema {
             .try_into_kernel()
             .map_err(|err: ArrowError| PyException::new_err(err.to_string()))?;
 
-        schema_to_pyobject(inner_type, py)
+        schema_to_pyobject(Arc::new(inner_type), py)
     }
 
     #[pyo3(text_signature = "($self)")]

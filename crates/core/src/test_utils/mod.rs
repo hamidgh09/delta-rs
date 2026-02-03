@@ -5,9 +5,42 @@ use std::{collections::HashMap, path::PathBuf, process::Command};
 use url::Url;
 
 pub use self::factories::*;
-use crate::DeltaTableBuilder;
+#[cfg(test)]
+use crate::DeltaTable;
+#[cfg(test)]
+use crate::kernel::LogicalFileView;
+#[cfg(test)]
+use crate::logstore::LogStoreRef;
+#[cfg(test)]
+use crate::table::state::DeltaTableState;
+use crate::{DeltaResult, DeltaTableBuilder};
+#[cfg(test)]
+use futures::TryStreamExt;
 
 pub type TestResult<T = ()> = Result<T, Box<dyn std::error::Error + 'static>>;
+
+#[cfg(test)]
+pub(crate) fn open_fs_path(path: &str) -> DeltaTable {
+    let url =
+        url::Url::from_directory_path(std::path::Path::new(path).canonicalize().unwrap()).unwrap();
+    DeltaTableBuilder::from_url(url).unwrap().build().unwrap()
+}
+
+/// Internal test helper function to return the raw paths from every file view in the snapshot.
+#[cfg(test)]
+pub(crate) async fn file_paths_from(
+    state: &DeltaTableState,
+    log_store: &LogStoreRef,
+) -> DeltaResult<Vec<String>> {
+    Ok(state
+        .snapshot()
+        .file_views(log_store, None)
+        .try_collect::<Vec<LogicalFileView>>()
+        .await?
+        .iter()
+        .map(|lfv| lfv.path().to_string())
+        .collect())
+}
 
 /// Reference tables from the test data folder
 pub enum TestTables {
@@ -65,9 +98,13 @@ impl TestTables {
         }
     }
 
-    pub fn table_builder(&self) -> DeltaTableBuilder {
-        let url = Url::from_directory_path(self.as_path()).unwrap();
-        DeltaTableBuilder::from_uri(url).with_allow_http(true)
+    pub fn table_builder(&self) -> DeltaResult<DeltaTableBuilder> {
+        let url = Url::from_directory_path(self.as_path()).map_err(|_| {
+            crate::DeltaTableError::InvalidTableLocation(
+                self.as_path().to_string_lossy().into_owned(),
+            )
+        })?;
+        DeltaTableBuilder::from_url(url).map(|b| b.with_allow_http(true))
     }
 }
 
@@ -92,7 +129,9 @@ pub fn with_env(vars: Vec<(&str, &str)>) -> impl Drop {
 
     // Set all the new environment variables
     for (key, value) in vars {
-        std::env::set_var(key, value);
+        unsafe {
+            std::env::set_var(key, value);
+        }
     }
 
     // Create a cleanup struct that will restore original values when dropped
@@ -102,8 +141,8 @@ pub fn with_env(vars: Vec<(&str, &str)>) -> impl Drop {
         fn drop(&mut self) {
             for (key, maybe_value) in self.0.iter() {
                 match maybe_value {
-                    Some(value) => std::env::set_var(key, value),
-                    None => std::env::remove_var(key),
+                    Some(value) => unsafe { std::env::set_var(key, value) },
+                    None => unsafe { std::env::remove_var(key) },
                 }
             }
         }
