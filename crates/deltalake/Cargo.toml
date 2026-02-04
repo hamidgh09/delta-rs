@@ -29,7 +29,7 @@ deltalake-core = { version = "0.30.0", path = "../core", default-features = fals
 deltalake-aws = { version = "0.13.0", path = "../aws", default-features = false, optional = true }
 deltalake-azure = { version = "0.13.0", path = "../azure", optional = true }
 deltalake-gcp = { version = "0.14.0", path = "../gcp", optional = true }
-deltalake-hdfs = { version = "0.14.0", path = "../hdfs", optional = true }
+deltalake-hdfs = { version = "1.0.0", path = "../hdfs", optional = true }
 deltalake-lakefs = { version = "0.13.0", path = "../lakefs", optional = true }
 deltalake-catalog-glue = { version = "0.14.0", path = "../catalog-glue", optional = true }
 deltalake-catalog-unity = { version = "0.14.0", path = "../catalog-unity", optional = true }

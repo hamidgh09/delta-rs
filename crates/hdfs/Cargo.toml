@@ -13,16 +13,18 @@ rust-version.workspace = true
 
 [dependencies]
 deltalake-core = { version = "0.30.0", path = "../core"}
-hdfs-native-object-store = { git = "https://github.com/logicalclocks/hopsfs-native-object-store.git" , branch = "dev"}
+hdfs-native-object-store = { git = "https://github.com/hamidgh09/hopsfs-native-object-store.git" , branch = "hopsfs-329"}
 
 # workspace dependencies
 tokio = { workspace = true }
 url = { workspace = true }
 
 [dev-dependencies]
+futures = { workspace = true }
+object_store = { workspace = true }
 serial_test = "3"
 deltalake-test = { path = "../test" }
-which = "7"
+walkdir = "2"
 
 [features]
 integration_test = ["hdfs-native-object-store/integration-test"]

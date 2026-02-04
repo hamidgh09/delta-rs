@@ -67,7 +67,7 @@ mod tests {
     fn test_parse_url_opts() -> DeltaResult<()> {
         let factory = HdfsFactory::default();
         let _ = factory.parse_url_opts(
-            &Url::parse("hdfs://localhost:9000").expect("Failed to parse hdfs://"),
+            &Url::parse("hdfs://localhost:8020").expect("Failed to parse hdfs://"),
             &StorageConfig::default(),
         )?;
         Ok(())
