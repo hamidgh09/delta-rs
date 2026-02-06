@@ -1,7 +1,12 @@
 [package]
 name = "deltalake-python"
-version = "1.1.2-post2"
-authors = ["Hamid Ghasemirahni <hamid@logicalclocks.com>", "Salman Niazi <salman@logicalclocks.com>"]
+version = "1.4.0"
+authors = [
+    "Qingping Hou <dave2008713@gmail.com>",
+    "Will Jones <willjones127@gmail.com>",
+    "Hamid Ghasemirahni <hamid@logicalclocks.com>",
+    "Salman Niazi <salman@logicalclocks.com>"
+]
 homepage = "https://github.com/logicalclocks/delta-rs"
 license = "Apache-2.0"
 description = "HopsFS compatible version of Native Delta Lake Python binding based on delta-rs with Pandas integration"
