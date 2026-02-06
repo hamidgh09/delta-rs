@@ -1,11 +1,13 @@
+#[cfg(feature = "datafusion")]
 #[cfg(test)]
 mod tests {
     use crate::{
-        checkpoints, kernel::transaction::CommitProperties, kernel::Transaction,
-        protocol::SaveMode, writer::test_utils::get_record_batch, DeltaOps, DeltaTableBuilder,
+        DeltaTable, DeltaTableBuilder, checkpoints, ensure_table_uri,
+        kernel::{Transaction, transaction::CommitProperties},
+        protocol::SaveMode,
+        writer::test_utils::get_record_batch,
     };
 
-    #[cfg(feature = "datafusion")]
     #[tokio::test]
     async fn test_app_txn_workload() {
         // Test that the transaction ids can be read from different scenarios
@@ -18,7 +20,7 @@ mod tests {
         let tmp_path = std::fs::canonicalize(tmp_dir.path()).unwrap();
 
         let batch = get_record_batch(None, false);
-        let table = DeltaOps::try_from_uri(tmp_path.to_str().unwrap())
+        let table = DeltaTable::try_from_url(ensure_table_uri(tmp_path.to_str().unwrap()).unwrap())
             .await
             .unwrap()
             .write(vec![batch.clone()])
@@ -30,12 +32,17 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(table.version(), Some(0));
-        assert_eq!(table.get_files_count(), 2);
+        let state = table.snapshot().unwrap();
+        assert_eq!(state.version(), 0);
+        assert_eq!(state.log_data().num_files(), 2);
 
-        let app_txns = table.get_app_transaction_version();
-        assert_eq!(app_txns.len(), 1);
-        assert_eq!(app_txns.get("my-app").map(|t| t.version), Some(1));
+        let app_txn = table
+            .snapshot()
+            .unwrap()
+            .transaction_version(&table.log_store(), "my-app")
+            .await
+            .unwrap();
+        assert_eq!(app_txn, Some(1));
 
         let log_store = table.log_store();
         let txn_version = table
@@ -48,14 +55,20 @@ mod tests {
 
         // Test Txn Id can be read from existing table
 
-        let mut table2 = DeltaTableBuilder::from_uri(tmp_path.to_str().unwrap())
-            .load()
+        let mut table2 =
+            DeltaTableBuilder::from_url(ensure_table_uri(tmp_path.to_str().unwrap()).unwrap())
+                .unwrap()
+                .load()
+                .await
+                .unwrap();
+        let app_txn2 = table2
+            .snapshot()
+            .unwrap()
+            .transaction_version(&table2.log_store(), "my-app")
             .await
             .unwrap();
-        let app_txns2 = table2.get_app_transaction_version();
 
-        assert_eq!(app_txns2.len(), 1);
-        assert_eq!(app_txns2.get("my-app").map(|t| t.version), Some(1));
+        assert_eq!(app_txn2, Some(1));
         let txn_version = table2
             .snapshot()
             .unwrap()
@@ -66,7 +79,7 @@ mod tests {
 
         // Write new data to the table and check that `update` functions work
 
-        let table = DeltaOps::from(table)
+        let table = table
             .write(vec![get_record_batch(None, false)])
             .with_commit_properties(
                 CommitProperties::default()
@@ -76,9 +89,13 @@ mod tests {
             .unwrap();
 
         assert_eq!(table.version(), Some(1));
-        let app_txns = table.get_app_transaction_version();
-        assert_eq!(app_txns.len(), 1);
-        assert_eq!(app_txns.get("my-app").map(|t| t.version), Some(3));
+        let app_txn = table
+            .snapshot()
+            .unwrap()
+            .transaction_version(&table.log_store(), "my-app")
+            .await
+            .unwrap();
+        assert_eq!(app_txn, Some(3));
         let txn_version = table
             .snapshot()
             .unwrap()
@@ -89,9 +106,13 @@ mod tests {
 
         table2.update_incremental(None).await.unwrap();
         assert_eq!(table2.version(), Some(1));
-        let app_txns2 = table2.get_app_transaction_version();
-        assert_eq!(app_txns2.len(), 1);
-        assert_eq!(app_txns2.get("my-app").map(|t| t.version), Some(3));
+        let app_txn2 = table2
+            .snapshot()
+            .unwrap()
+            .transaction_version(&table2.log_store(), "my-app")
+            .await
+            .unwrap();
+        assert_eq!(app_txn2, Some(3));
         let txn_version = table2
             .snapshot()
             .unwrap()
@@ -102,13 +123,19 @@ mod tests {
 
         // Create a checkpoint and then load
         checkpoints::create_checkpoint(&table, None).await.unwrap();
-        let table3 = DeltaTableBuilder::from_uri(tmp_path.to_str().unwrap())
-            .load()
+        let table3 =
+            DeltaTableBuilder::from_url(ensure_table_uri(tmp_path.to_str().unwrap()).unwrap())
+                .unwrap()
+                .load()
+                .await
+                .unwrap();
+        let app_txn3 = table3
+            .snapshot()
+            .unwrap()
+            .transaction_version(&table3.log_store(), "my-app")
             .await
             .unwrap();
-        let app_txns3 = table3.get_app_transaction_version();
-        assert_eq!(app_txns3.len(), 1);
-        assert_eq!(app_txns3.get("my-app").map(|t| t.version), Some(3));
+        assert_eq!(app_txn3, Some(3));
         assert_eq!(table3.version(), Some(1));
         let txn_version = table3
             .snapshot()

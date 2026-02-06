@@ -1,64 +1,38 @@
 //! Delta Table read and write implementation
 
-use std::cmp::{min, Ordering};
-use std::collections::HashMap;
+use std::cmp::{Ordering, min};
 use std::fmt;
 use std::fmt::Formatter;
+use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
+use futures::future::ready;
+use futures::stream::{BoxStream, once};
 use futures::{StreamExt, TryStreamExt};
-use object_store::{path::Path, ObjectStore};
+use object_store::{ObjectStore, path::Path};
 use serde::de::{Error, SeqAccess, Visitor};
 use serde::ser::SerializeSeq;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use url::Url;
 
 use self::builder::DeltaTableConfig;
 use self::state::DeltaTableState;
-use crate::kernel::{
-    CommitInfo, DataCheck, DataType, LogicalFile, Metadata, Protocol, StructType, Transaction,
-};
+use crate::kernel::{CommitInfo, DataCheck, LogicalFileView};
 use crate::logstore::{
-    commit_uri_from_version, extract_version_from_filename, LogStoreConfig, LogStoreExt,
-    LogStoreRef, ObjectStoreRef,
+    LogStoreConfig, LogStoreExt, LogStoreRef, ObjectStoreRef, commit_uri_from_version,
+    extract_version_from_filename,
 };
 use crate::partitions::PartitionFilter;
-use crate::{DeltaResult, DeltaTableError};
-
-// NOTE: this use can go away when peek_next_commit is removed off of [DeltaTable]
-pub use crate::logstore::PeekCommit;
+use crate::{DeltaResult, DeltaTableBuilder, DeltaTableError};
 
 pub mod builder;
 pub mod config;
 pub mod state;
-pub mod state_arrow;
 
 mod columns;
 
 // Re-exposing for backwards compatibility
 pub use columns::*;
-
-/// Return partition fields along with their data type from the current schema.
-pub(crate) fn get_partition_col_data_types<'a>(
-    schema: &'a StructType,
-    metadata: &'a Metadata,
-) -> Vec<(&'a String, &'a DataType)> {
-    // JSON add actions contain a `partitionValues` field which is a map<string, string>.
-    // When loading `partitionValues_parsed` we have to convert the stringified partition values back to the correct data type.
-    schema
-        .fields()
-        .filter_map(|f| {
-            if metadata
-                .partition_columns()
-                .iter()
-                .any(|s| s.as_str() == f.name())
-            {
-                Some((f.name(), f.data_type()))
-            } else {
-                None
-            }
-        })
-        .collect()
-}
 
 /// In memory representation of a Delta Table
 ///
@@ -116,9 +90,11 @@ impl<'de> Deserialize<'de> for DeltaTable {
                 let storage_config: LogStoreConfig = seq
                     .next_element()?
                     .ok_or_else(|| A::Error::invalid_length(0, &self))?;
-                let log_store =
-                    crate::logstore::logstore_for(storage_config.location, storage_config.options)
-                        .map_err(|_| A::Error::custom("Failed deserializing LogStore"))?;
+                let log_store = crate::logstore::logstore_for(
+                    storage_config.location(),
+                    storage_config.options().clone(),
+                )
+                .map_err(|_| A::Error::custom("Failed deserializing LogStore"))?;
 
                 let table = DeltaTable {
                     state,
@@ -146,16 +122,31 @@ impl DeltaTable {
         }
     }
 
+    /// Create a new [`DeltaTable`] instance, backed by an un-initialized in memory table
+    ///
+    /// Using this will not persist any changes beyond the lifetime of the table object.
+    /// The main purpose of in-memory tables is for use in testing.
+    ///
+    /// ```
+    /// use deltalake_core::DeltaTable;
+    /// let table = DeltaTable::new_in_memory();
+    /// ```
+    pub fn new_in_memory() -> Self {
+        let url = Url::parse("memory:///").unwrap();
+        DeltaTableBuilder::from_url(url).unwrap().build().unwrap()
+    }
+
     /// Create a new [`DeltaTable`] from a [`DeltaTableState`] without loading any
     /// data from backing storage.
     ///
     /// NOTE: This is for advanced users. If you don't know why you need to use this method,
     /// please call one of the `open_table` helper methods instead.
     pub(crate) fn new_with_state(log_store: LogStoreRef, state: DeltaTableState) -> Self {
+        let config = state.load_config().clone();
         Self {
             state: Some(state),
             log_store,
-            config: Default::default(),
+            config,
         }
     }
 
@@ -170,8 +161,8 @@ impl DeltaTable {
     }
 
     /// The URI of the underlying data
-    pub fn table_uri(&self) -> String {
-        self.log_store.root_uri()
+    pub fn table_url(&self) -> &Url {
+        self.log_store.root_url()
     }
 
     /// get a shared reference to the log store
@@ -201,7 +192,7 @@ impl DeltaTable {
 
     /// Updates the DeltaTable to the most recent state committed to the transaction log by
     /// loading the last checkpoint and incrementally applying each version since.
-    pub async fn update(&mut self) -> Result<(), DeltaTableError> {
+    pub async fn update_state(&mut self) -> Result<(), DeltaTableError> {
         self.update_incremental(None).await
     }
 
@@ -211,24 +202,18 @@ impl DeltaTable {
         &mut self,
         max_version: Option<i64>,
     ) -> Result<(), DeltaTableError> {
-        match self.state.as_mut() {
-            Some(state) => state.update(&self.log_store, max_version).await,
-            _ => {
-                let state =
-                    DeltaTableState::try_new(&self.log_store, self.config.clone(), max_version)
-                        .await?;
-                self.state = Some(state);
-                Ok(())
-            }
-        }
+        self.state = Some(
+            DeltaTableState::try_new(&self.log_store, self.config.clone(), max_version).await?,
+        );
+        Ok(())
     }
 
     /// Loads the DeltaTable state for the given version.
     pub async fn load_version(&mut self, version: i64) -> Result<(), DeltaTableError> {
-        if let Some(snapshot) = &self.state {
-            if snapshot.version() > version {
-                self.state = None;
-            }
+        if let Some(snapshot) = &self.state
+            && snapshot.version() > version
+        {
+            self.state = None;
         }
         self.update_incremental(Some(version)).await
     }
@@ -255,63 +240,82 @@ impl DeltaTable {
     /// The table history retention is based on the `logRetentionDuration` property of the Delta Table, 30 days by default.
     /// If `limit` is given, this returns the information of the latest `limit` commits made to this table. Otherwise,
     /// it returns all commits from the earliest commit.
-    pub async fn history(&self, limit: Option<usize>) -> Result<Vec<CommitInfo>, DeltaTableError> {
+    pub async fn history(
+        &self,
+        limit: Option<usize>,
+    ) -> Result<impl Iterator<Item = CommitInfo> + use<>, DeltaTableError> {
         let infos = self
             .snapshot()?
-            .snapshot
+            .snapshot()
             .snapshot()
             .commit_infos(&self.log_store(), limit)
             .await?
             .try_collect::<Vec<_>>()
             .await?;
-        Ok(infos.into_iter().flatten().collect())
+        Ok(infos.into_iter().flatten())
     }
 
-    /// Obtain Add actions for files that match the filter
-    pub fn get_active_add_actions_by_partitions<'a>(
-        &'a self,
-        filters: &'a [PartitionFilter],
-    ) -> Result<impl Iterator<Item = DeltaResult<LogicalFile<'a>>>, DeltaTableError> {
-        self.state
-            .as_ref()
-            .ok_or(DeltaTableError::NoMetadata)?
-            .get_active_add_actions_by_partitions(filters)
+    #[cfg(test)]
+    /// We have enough internal tests that just need to check the last commit of the table.
+    ///
+    /// This is a silly convenience function to reduce some copy-paste in tests
+    pub(crate) async fn last_commit(&self) -> Result<CommitInfo, DeltaTableError> {
+        let mut infos: Vec<_> = self.history(Some(1)).await?.collect();
+        infos.pop().ok_or(DeltaTableError::Generic(
+            "Somehow there is nothing in the history!".into(),
+        ))
+    }
+
+    /// Stream all logical files matching the provided `PartitionFilter`s.
+    pub fn get_active_add_actions_by_partitions(
+        &self,
+        filters: &[PartitionFilter],
+    ) -> BoxStream<'_, DeltaResult<LogicalFileView>> {
+        let Some(state) = self.state.as_ref() else {
+            return Box::pin(futures::stream::once(async {
+                Err(DeltaTableError::NotInitialized)
+            }));
+        };
+
+        if filters.is_empty() {
+            return state.snapshot().file_views(&self.log_store, None);
+        }
+
+        let predicate =
+            match crate::to_kernel_predicate(filters, state.snapshot().schema().as_ref()) {
+                Ok(predicate) => Arc::new(predicate),
+                Err(err) => return Box::pin(once(ready(Err(err)))),
+            };
+        state
+            .snapshot()
+            .file_views(&self.log_store, Some(predicate))
     }
 
     /// Returns the file list tracked in current table state filtered by provided
     /// `PartitionFilter`s.
-    pub fn get_files_by_partitions(
+    pub async fn get_files_by_partitions(
         &self,
         filters: &[PartitionFilter],
     ) -> Result<Vec<Path>, DeltaTableError> {
         Ok(self
-            .get_active_add_actions_by_partitions(filters)?
-            .collect::<Result<Vec<_>, _>>()?
+            .get_active_add_actions_by_partitions(filters)
+            .try_collect::<Vec<_>>()
+            .await?
             .into_iter()
             .map(|add| add.object_store_path())
             .collect())
     }
 
     /// Return the file uris as strings for the partition(s)
-    pub fn get_file_uris_by_partitions(
+    pub async fn get_file_uris_by_partitions(
         &self,
         filters: &[PartitionFilter],
     ) -> Result<Vec<String>, DeltaTableError> {
-        let files = self.get_files_by_partitions(filters)?;
+        let files = self.get_files_by_partitions(filters).await?;
         Ok(files
             .iter()
             .map(|fname| self.log_store.to_uri(fname))
             .collect())
-    }
-
-    /// Returns an iterator of file names present in the loaded state
-    #[inline]
-    pub fn get_files_iter(&self) -> DeltaResult<impl Iterator<Item = Path> + '_> {
-        Ok(self
-            .state
-            .as_ref()
-            .ok_or(DeltaTableError::NoMetadata)?
-            .file_paths_iter())
     }
 
     /// Returns a URIs for all active files present in the current table version.
@@ -319,57 +323,26 @@ impl DeltaTable {
         Ok(self
             .state
             .as_ref()
-            .ok_or(DeltaTableError::NoMetadata)?
-            .file_paths_iter()
+            .ok_or(DeltaTableError::NotInitialized)?
+            .log_data()
+            .into_iter()
+            .map(|add| add.object_store_path())
             .map(|path| self.log_store.to_uri(&path)))
     }
 
-    /// Get the number of files in the table - returns 0 if no metadata is loaded
-    pub fn get_files_count(&self) -> usize {
-        self.state.as_ref().map(|s| s.files_count()).unwrap_or(0)
-    }
-
     /// Returns the currently loaded state snapshot.
+    ///
+    /// This method provides access to the currently loaded state of the Delta table.
+    ///
+    /// ## Returns
+    ///
+    /// A reference to the current state of the Delta table.
+    ///
+    /// ## Errors
+    ///
+    /// Returns [`NotInitialized`](DeltaTableError::NotInitialized) if the table has not been initialized.
     pub fn snapshot(&self) -> DeltaResult<&DeltaTableState> {
         self.state.as_ref().ok_or(DeltaTableError::NotInitialized)
-    }
-
-    /// Returns current table protocol
-    pub fn protocol(&self) -> DeltaResult<&Protocol> {
-        Ok(self
-            .state
-            .as_ref()
-            .ok_or(DeltaTableError::NoMetadata)?
-            .protocol())
-    }
-
-    /// Returns the metadata associated with the loaded state.
-    pub fn metadata(&self) -> Result<&Metadata, DeltaTableError> {
-        Ok(self.snapshot()?.metadata())
-    }
-
-    #[deprecated(
-        since = "0.27.0",
-        note = "Use `snapshot()?.transaction_version(app_id)` instead."
-    )]
-    /// Returns the current version of the DeltaTable based on the loaded metadata.
-    pub fn get_app_transaction_version(&self) -> HashMap<String, Transaction> {
-        self.state
-            .as_ref()
-            .and_then(|s| s.snapshot.transactions.clone())
-            .unwrap_or_default()
-    }
-
-    /// Return table schema parsed from transaction log. Return None if table hasn't been loaded or
-    /// no metadata was found in the log.
-    pub fn schema(&self) -> Option<&StructType> {
-        Some(self.snapshot().ok()?.schema())
-    }
-
-    /// Return table schema parsed from transaction log. Return `DeltaTableError` if table hasn't
-    /// been loaded or no metadata was found in the log.
-    pub fn get_schema(&self) -> Result<&StructType, DeltaTableError> {
-        Ok(self.snapshot()?.schema())
     }
 
     /// Time travel Delta table to the latest version that's created at or before provided
@@ -420,7 +393,7 @@ impl DeltaTable {
             Err(DeltaTableError::InvalidVersion(_)) => {
                 return Err(DeltaTableError::NotATable(
                     log_store.table_root_url().to_string(),
-                ))
+                ));
             }
             Err(e) => return Err(e),
         };
@@ -457,15 +430,40 @@ impl DeltaTable {
 
 impl fmt::Display for DeltaTable {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        writeln!(f, "DeltaTable({})", self.table_uri())?;
+        writeln!(f, "DeltaTable({})", self.table_url())?;
         writeln!(f, "\tversion: {:?}", self.version())
     }
 }
 
 impl std::fmt::Debug for DeltaTable {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> Result<(), std::fmt::Error> {
-        write!(f, "DeltaTable <{}>", self.table_uri())
+        write!(f, "DeltaTable <{}>", self.table_url())
     }
+}
+
+/// Normalize a given [Url] to **always** contain a trailing slash. This is critically important
+/// for assumptions about [Url] equivalency and more importantly for **joining** on a Url`.
+///
+/// This function will also remove redundant slashes in the ]Url] path which can cause other
+/// equivalency failures
+///
+/// ```ignore
+///  left.join("_delta_log"); // produces `s3://bucket/prefix/_delta_log`
+///  right.join("_delta_log"); // produces `s3://bucket/_delta_log`
+/// ```
+pub fn normalize_table_url(url: &Url) -> Url {
+    let mut new_segments = vec![];
+    for segment in url.path().split('/') {
+        if !segment.is_empty() {
+            new_segments.push(segment);
+        }
+    }
+    // Add a trailing slash segment
+    new_segments.push("");
+
+    let mut url = url.clone();
+    url.set_path(&new_segments.join("/"));
+    url
 }
 
 #[cfg(test)]
@@ -476,6 +474,33 @@ mod tests {
     use super::*;
     use crate::kernel::{DataType, PrimitiveType, StructField};
     use crate::operations::create::CreateBuilder;
+
+    #[test]
+    fn test_normalize_table_url() {
+        for (u, path) in [
+            (Url::parse("s3://bucket/prefix/").unwrap(), "/prefix/"),
+            (Url::parse("s3://bucket/prefix").unwrap(), "/prefix/"),
+            (
+                Url::parse("s3://bucket/prefix with space/").unwrap(),
+                "/prefix%20with%20space/",
+            ),
+            (
+                Url::parse("s3://bucket/special&chars/你好/😊").unwrap(),
+                "/special&chars/%E4%BD%A0%E5%A5%BD/%F0%9F%98%8A/",
+            ),
+            (
+                Url::parse("s3://bucket/prefix/with/redundant/slashes//").unwrap(),
+                "/prefix/with/redundant/slashes/",
+            ),
+        ] {
+            assert_eq!(
+                normalize_table_url(&u).path(),
+                path,
+                "Failed to normalize: {}",
+                u.as_str()
+            );
+        }
+    }
 
     #[tokio::test]
     async fn table_round_trip() {

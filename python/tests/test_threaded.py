@@ -44,10 +44,7 @@ def test_concurrency(existing_table: DeltaTable, sample_data_pyarrow: "pa.Table"
         t.join()
 
     assert isinstance(exception, CommitFailedError)
-    assert (
-        "a concurrent transaction deleted the same data your transaction deletes"
-        in str(exception)
-    )
+    assert "a concurrent transaction deleted data this operation read" in str(exception)
 
 
 @pytest.mark.polars
@@ -77,5 +74,10 @@ def test_multithreaded_write_using_path(tmp_path: pathlib.Path):
 
     with ThreadPoolExecutor() as exe:
         list(
-            exe.map(lambda _: write_deltalake(tmp_path, table, mode="append"), range(5))
+            exe.map(
+                lambda _: write_deltalake(
+                    tmp_path, pl.DataFrame({"a": [1, 2, 3]}), mode="append"
+                ),
+                range(5),
+            )
         )
