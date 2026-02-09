@@ -1,17 +1,6 @@
 name: docs
 
 on:
-  merge_group:
-  pull_request:
-    paths:
-      - python/**
-      - docs/**
-      - mkdocs.yml
-      - .github/workflows/docs.yml
-  repository_dispatch:
-    types:
-      - release-docs
-  # Allow manual trigger for now
   workflow_dispatch:
 
 env:
