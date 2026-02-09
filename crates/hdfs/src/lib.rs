@@ -52,7 +52,7 @@ impl LogStoreFactory for HdfsFactory {
 /// Register an [ObjectStoreFactory] for common HDFS [Url] schemes
 pub fn register_handlers(_additional_prefixes: Option<Url>) {
     let factory = Arc::new(HdfsFactory {});
-    for scheme in ["hdfs", "viewfs"].iter() {
+    for scheme in ["hdfs", "hopsfs", "viewfs"].iter() {
         let url = Url::parse(&format!("{scheme}://")).unwrap();
         object_store_factories().insert(url.clone(), factory.clone());
         logstore_factories().insert(url.clone(), factory.clone());
