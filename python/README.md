@@ -23,6 +23,14 @@ dt.file_uris()
 
 See the [user guide](https://delta-io.github.io/delta-rs/usage/installation/) for more examples.
 
+## Compatibility Matrix
+
+| hops-deltalake | hops-object-store | HopsFS                              |
+|----------------|-------------------|-------------------------------------|
+| 1.1.2-post2    | 1.0.3             | 3.2.0.18                            |
+| 1.4.0          | 1.1.0             | 3.2.0.18-EE-RC1                     |
+| 1.4.0-post1    | 1.1.1             | >= 3.2.0.18-EE-RC1 < 3.4.4.0-EE-RC0 |
+
 ## Installation
 
 ```bash
